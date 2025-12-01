@@ -26,26 +26,10 @@ except ModuleNotFoundError as exc:
 CURRENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_DIR.parent
 
-# Add RAGSystem to path
-for candidate in (
-    PROJECT_ROOT / "RAGSystem.py",
-    PROJECT_ROOT / "RAG system" / "RAGSystem.py",
-    PROJECT_ROOT / "RAGsystem" / "RAGSystem.py",
-    CURRENT_DIR / "RAGSystem.py",
-):
-    if candidate.exists():
-        module_dir = str(candidate.parent)
-        if module_dir not in sys.path:
-            sys.path.insert(0, module_dir)
-        break
-
-for extra_path in (PROJECT_ROOT / "NSTSCE", CURRENT_DIR):
-    if extra_path.exists():
-        path_str = str(extra_path)
-        if path_str not in sys.path:
-            sys.path.insert(0, path_str)
-
-from RAGSystem import RAGConfig, RAGSystem, setup_logging  # type: ignore
+# RAG system imports will be loaded dynamically based on --rag-system argument
+RAGConfig = None
+RAGSystem = None
+setup_logging = None
 
 # Import our new modules
 from dataset_loaders import (
@@ -69,6 +53,69 @@ from evaluation_metrics import (
     calculate_rouge_l_score,
     extract_reference_answers,
 )
+
+
+def load_rag_system(rag_system_name: str) -> None:
+    """Dynamically load the RAG system based on the selection."""
+    global RAGConfig, RAGSystem, setup_logging
+    import importlib.util
+    
+    # Clear any existing imports
+    if 'RAGSystem' in sys.modules:
+        del sys.modules['RAGSystem']
+    
+    # Add necessary paths
+    for extra_path in (PROJECT_ROOT / "NSTSCE", CURRENT_DIR):
+        if extra_path.exists():
+            path_str = str(extra_path)
+            if path_str not in sys.path:
+                sys.path.insert(0, path_str)
+    
+    if rag_system_name == "naive-rag":
+        # Load naive-rag from RAGSystem/naive-rag/RAGSystem.py
+        naive_rag_path = PROJECT_ROOT / "RAGSystem" / "naive-rag" / "RAGSystem.py"
+        if not naive_rag_path.exists():
+            raise FileNotFoundError(f"Naive RAG system not found at {naive_rag_path}")
+        
+        module_dir = str(naive_rag_path.parent)
+        if module_dir not in sys.path:
+            sys.path.insert(0, module_dir)
+        
+        from RAGSystem import RAGConfig, RAGSystem, setup_logging  # type: ignore
+        
+    elif rag_system_name == "self-rag":
+        # Load self-rag from RAGSystem/self-rag/RAGSystem.py
+        self_rag_path = PROJECT_ROOT / "RAGSystem" / "self-rag" / "RAGSystem.py"
+        if not self_rag_path.exists():
+            raise FileNotFoundError(
+                f"Self-RAG system not found at {self_rag_path}. "
+                "Please ensure self-rag has a RAGSystem.py file with RAGConfig, RAGSystem, and setup_logging."
+            )
+        
+        # Use importlib to load the module with a unique name
+        spec = importlib.util.spec_from_file_location("self_rag_system", self_rag_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Failed to create spec for {self_rag_path}")
+        
+        module = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(module)
+        except ImportError as e:
+            # Provide helpful error message if vLLM is missing
+            error_str = str(e).lower()
+            if "vllm" in error_str or "vllm is required" in error_str:
+                raise ImportError(
+                    f"Self-RAG requires vLLM which is not installed.\n"
+                    f"Install it with: pip install vllm\n"
+                    f"Or use naive-rag instead by setting --rag-system naive-rag"
+                ) from e
+            raise
+        
+        RAGConfig = module.RAGConfig
+        RAGSystem = module.RAGSystem
+        setup_logging = module.setup_logging
+    else:
+        raise ValueError(f"Unknown RAG system: {rag_system_name}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -144,6 +191,12 @@ def parse_args() -> argparse.Namespace:
         help="Hide retrieved context in outputs.",
     )
     parser.set_defaults(show_context=True)
+    parser.add_argument(
+        "--rag-system",
+        choices=["naive-rag", "self-rag"],
+        default="naive-rag",
+        help="RAG system to use: 'naive-rag' (default) or 'self-rag'.",
+    )
     args = parser.parse_args()
     if args.generator_model.lower() == "chatgpt5" and not args.chatgpt5_api_key:
         parser.error("generator_model 'chatgpt5' requires --chatgpt5-api-key.")
@@ -275,8 +328,14 @@ def print_results(
 def main() -> None:
     """Main execution function."""
     args = parse_args()
+    
+    # Load the selected RAG system
+    load_rag_system(args.rag_system)
+    
     setup_logging(args.log_level)
     logger = logging.getLogger(__name__)
+    
+    logger.info("Using RAG system: %s", args.rag_system)
     
     use_chatgpt5 = args.generator_model.lower() == "chatgpt5"
     generator_model_name = "t5-small" if use_chatgpt5 else args.generator_model
@@ -443,6 +502,7 @@ def main() -> None:
                 "reference_answers": reference_answers,
                 "retrieved_context": retrieved_metadata if args.show_context else [],
                 "generator": "chatgpt5" if use_chatgpt5 else args.generator_model,
+                "rag_system": args.rag_system,  # Track which RAG system was used
                 "dataset": dataset_name,  # Use top-level dataset name, not sub-dataset from record
                 "total_questions_in_dataset": total_questions_in_dataset,  # Total questions in entire dataset
                 "total_questions_available": total_questions_available,  # Questions available based on config

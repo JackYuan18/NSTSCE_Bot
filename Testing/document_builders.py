@@ -4,10 +4,49 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 from html.parser import HTMLParser
-from typing import Any, Dict, List, Tuple
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 
-from RAGSystem import RAGSystem  # type: ignore
+if TYPE_CHECKING:
+    from RAGSystem import RAGSystem  # type: ignore
+else:
+    # Set up path for RAGSystem import at runtime
+    CURRENT_DIR = Path(__file__).resolve().parent
+    PROJECT_ROOT = CURRENT_DIR.parent
+    
+    # Add necessary paths for dependencies
+    for extra_path in (PROJECT_ROOT / "NSTSCE", CURRENT_DIR):
+        if extra_path.exists():
+            path_str = str(extra_path)
+            if path_str not in sys.path:
+                sys.path.insert(0, path_str)
+    
+    # Add naive-rag to path (default location)
+    naive_rag_path = PROJECT_ROOT / "RAGSystem" / "naive-rag" / "RAGSystem.py"
+    if naive_rag_path.exists():
+        module_dir = str(naive_rag_path.parent)
+        if module_dir not in sys.path:
+            sys.path.insert(0, module_dir)
+        from RAGSystem import RAGSystem  # type: ignore
+    else:
+        # Fallback: try to import from other possible locations
+        for candidate in (
+            PROJECT_ROOT / "RAGSystem" / "RAGSystem.py",
+            PROJECT_ROOT / "RAGSystem.py",
+            CURRENT_DIR / "RAGSystem.py",
+        ):
+            if candidate.exists():
+                module_dir = str(candidate.parent)
+                if module_dir not in sys.path:
+                    sys.path.insert(0, module_dir)
+                from RAGSystem import RAGSystem  # type: ignore
+                break
+        else:
+            # If all else fails, create a dummy class for type hints
+            class RAGSystem:  # type: ignore
+                pass
 
 
 class HTMLStripper(HTMLParser):

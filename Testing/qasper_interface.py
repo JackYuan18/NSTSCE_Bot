@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -48,8 +49,21 @@ def run_test_script(options: argparse.Namespace) -> subprocess.CompletedProcess[
     results_path_abs = RESULTS_PATH.resolve()
     results_path_abs.parent.mkdir(parents=True, exist_ok=True)
     
+    # Use the Python from the conda environment if available
+    # Check if we're in a conda environment
+    python_executable = sys.executable
+    if 'CONDA_DEFAULT_ENV' in os.environ:
+        # Try to use conda's python explicitly
+        conda_env = os.environ.get('CONDA_DEFAULT_ENV')
+        conda_prefix = os.environ.get('CONDA_PREFIX')
+        if conda_prefix:
+            conda_python = os.path.join(conda_prefix, 'bin', 'python')
+            if os.path.exists(conda_python):
+                python_executable = conda_python
+                app.logger.info(f"Using conda environment Python: {python_executable}")
+    
     cmd = [
-        sys.executable,
+        python_executable,
         str(DEFAULT_TEST_SCRIPT),
         "--dataset",
         dataset,
@@ -65,6 +79,8 @@ def run_test_script(options: argparse.Namespace) -> subprocess.CompletedProcess[
         str(options.chunk_size),
         "--generator-model",
         options.generator_model,
+        "--rag-system",
+        getattr(options, "rag_system", "naive-rag"),
         "--log-level",
         options.log_level,
         "--save-json",
@@ -376,7 +392,7 @@ TEMPLATE = """
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Qasper RAG Test Results</title>
+  <title>Testing RAG pipelines</title>
   <style>
     body { font-family: Arial, sans-serif; margin: 2rem; background: #f8f9fa; color: #212529; }
     h1 { margin-bottom: 0.5rem; }
@@ -441,7 +457,8 @@ TEMPLATE = """
 </head>
 <body>
   {% set generator_label = 'ChatGPT 5' if config.generator_model == 'chatgpt5' else config.generator_model %}
-  <h1>Qasper RAG Test Results</h1>
+  <h1>Testing RAG pipelines</h1>
+  <p style="font-size: 0.9rem; color: #6c757d; margin-top: -0.5rem; margin-bottom: 1rem;">Testing within single document RAG*</p>
   <div class="meta">
     <p>Results file: <code>{{ results_path }}</code></p>
     <p>
@@ -452,6 +469,7 @@ TEMPLATE = """
       &nbsp;|&nbsp; <strong>Questions/article:</strong> <code id="config-questions_per_article" class="config-value">{{ config.questions_per_article }}</code>
       &nbsp;|&nbsp; <strong>Split:</strong> <code id="config-split" class="config-value">{{ config.split }}</code>
       &nbsp;|&nbsp; <strong>Datasets:</strong> <code id="config-dataset" class="config-value">{{ config.datasets or config.dataset }}</code>
+      &nbsp;|&nbsp; <strong>RAG System:</strong> <code id="config-rag_system" class="config-value">{{ config.rag_system }}</code>
       &nbsp;|&nbsp; <strong>Show context:</strong> <code id="config-show_context" class="config-value">{{ 'Yes' if config.show_context else 'No' }}</code>
     </p>
     <p>Total questions processed: <strong id="total-questions">0</strong></p>
@@ -497,6 +515,13 @@ TEMPLATE = """
           <span>LongBench</span>
         </label>
       </div>
+    </label>
+    <label for="input-rag_system">
+      RAG System
+      <select id="input-rag_system" name="rag_system" class="param-input" data-default="{{ config.rag_system }}" data-type="string" data-target="config-rag_system">
+        <option value="naive-rag" {% if config.rag_system == 'naive-rag' %}selected{% endif %}>Naive RAG</option>
+        <option value="self-rag" {% if config.rag_system == 'self-rag' %}selected{% endif %}>Self-RAG</option>
+      </select>
     </label>
     <label for="input-generator_model">
       Generator
@@ -619,6 +644,13 @@ TEMPLATE = """
           }
         } else if (targetId === 'config-show_context') {
           displayValue = displayValue === 'true' ? 'Yes' : 'No';
+        } else if (targetId === 'config-rag_system') {
+          // Display RAG system name
+          if (displayValue === 'naive-rag') {
+            displayValue = 'Naive RAG';
+          } else if (displayValue === 'self-rag') {
+            displayValue = 'Self-RAG';
+          }
         } else if (targetId === 'config-dataset') {
           // Display selected datasets
             if (Array.isArray(displayValue)) {
@@ -1143,6 +1175,14 @@ TEMPLATE = """
           overrides.generator_model = generatorValue;
         }
         
+        // Handle RAG system selection
+        const ragSystemSelect = document.getElementById('input-rag_system');
+        if (ragSystemSelect) {
+          const ragSystemValue = ragSystemSelect.value.trim();
+          // Always include rag_system in overrides to ensure it's passed to the test script
+          overrides.rag_system = ragSystemValue;
+        }
+        
         // Handle multiple dataset selection from checkboxes
         const checkedDatasets = Array.from(datasetCheckboxes)
           .filter(cb => cb.checked)
@@ -1250,6 +1290,7 @@ def index():
             "split": TEST_OPTIONS.split,
             "dataset": default_dataset,  # For backward compatibility
             "datasets": default_datasets if default_datasets else [default_dataset],
+            "rag_system": getattr(TEST_OPTIONS, "rag_system", "naive-rag"),
             "show_context": TEST_OPTIONS.show_context,
         },
     )
@@ -1321,6 +1362,13 @@ def trigger_run():
     if "generator_model" in payload and payload["generator_model"]:
         options_dict["generator_model"] = str(payload["generator_model"]).strip()
 
+    if "rag_system" in payload and payload["rag_system"]:
+        rag_system_value = str(payload["rag_system"]).strip().lower()
+        if rag_system_value in ("naive-rag", "self-rag"):
+            options_dict["rag_system"] = rag_system_value
+        else:
+            options_dict["rag_system"] = "naive-rag"
+
     # Handle dataset selection (single or multiple)
     if "datasets" in payload and isinstance(payload["datasets"], list) and payload["datasets"]:
         # Multiple datasets
@@ -1387,6 +1435,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--show-context", dest="show_context", action="store_true", help="Display retrieved context in outputs.")
     parser.add_argument("--hide-context", dest="show_context", action="store_false", help="Hide retrieved context in outputs.")
     parser.set_defaults(show_context=False)
+    parser.add_argument("--rag-system", choices=["naive-rag", "self-rag"], default="naive-rag", help="RAG system to use: 'naive-rag' (default) or 'self-rag'.")
     parser.add_argument("--dataset", choices=["qasper", "qmsum", "narrativeqa", "quality", "hotpot", "musique", "xsum", "wikiasp", "longbench"], default="qasper", help="Dataset to use: 'qasper', 'qmsum', 'narrativeqa', 'quality', 'hotpot', 'musique', 'xsum', 'wikiasp', or 'longbench'.")
     parser.add_argument("--log-level", default="INFO", help="Log level passed to the test script.")
     parser.add_argument("--results-path", default=str(DEFAULT_RESULTS_PATH), help="Where to write the results JSON.")
