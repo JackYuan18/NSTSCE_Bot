@@ -111,8 +111,55 @@ def run_test_script(options: argparse.Namespace) -> subprocess.CompletedProcess[
     app.logger.info("Test script path: %s (exists: %s)", DEFAULT_TEST_SCRIPT, DEFAULT_TEST_SCRIPT.exists())
     
     try:
-        result = subprocess.run(cmd, check=False, capture_output=True, text=True, cwd=str(CURRENT_DIR), timeout=3600)
+        # Use Popen to capture output in real-time for progress messages
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # Combine stderr into stdout
+            text=True,
+            bufsize=1,  # Line buffered
+            cwd=str(CURRENT_DIR),
+            universal_newlines=True
+        )
+        
+        stdout_lines = []
+        stderr_lines = []
+        
+        # Read output line by line to capture progress messages
+        for line in iter(process.stdout.readline, ''):
+            if not line:
+                break
+            
+            line = line.rstrip()
+            stdout_lines.append(line)
+            
+            # Check if this is a [Self-RAG] progress message
+            if "[Self-RAG]" in line:
+                # Extract the message after [Self-RAG]
+                # Format: "2025-12-02 15:31:01,940 - self_rag_system - INFO - [Self-RAG] Embedding 100 passages..."
+                # Or simpler: "[Self-RAG] Embedding 100 passages..."
+                message_start = line.find("[Self-RAG]")
+                if message_start != -1:
+                    progress_msg = line[message_start + len("[Self-RAG]"):].strip()
+                    # Update RUN_STATE with progress message
+                    RUN_STATE["message"] = f"Test in progress... {progress_msg}"
+                    app.logger.debug("Progress: %s", progress_msg)
+            
+            # Also log the line
+            app.logger.debug("Test output: %s", line)
+        
+        # Wait for process to complete
+        returncode = process.wait(timeout=3600)
+        
+        # Combine stdout and stderr
+        stdout = "\n".join(stdout_lines)
+        stderr = ""  # Already captured in stdout
+        
+        result = subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
+        
     except subprocess.TimeoutExpired:
+        if 'process' in locals():
+            process.kill()
         app.logger.error("Test script timed out after 1 hour")
         return subprocess.CompletedProcess(cmd, 1, "", "Test script timed out")
     except Exception as exc:
@@ -220,7 +267,7 @@ def start_test_run(options: argparse.Namespace, *, async_run: bool = True) -> bo
         return False
 
     RUN_STATE["status"] = "running"
-    RUN_STATE["message"] = "Test run in progress..."
+    RUN_STATE["message"] = "Test in progress..."
     RUN_STATE["last_result"] = None
     app.logger.info("Starting test run with options: dataset=%s, split=%s, articles=%s, questions_per_article=%s",
                    getattr(options, "dataset", "unknown"), getattr(options, "split", "unknown"),

@@ -17,15 +17,32 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
+CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR.parent
+
+# Add project root to path for error handler utilities
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# Import error handler utilities
+try:
+    from error_handler_utils import handle_dependency_error, is_dependency_error
+except ImportError:
+    # Fallback if utility module is not available
+    def handle_dependency_error(error, conda_env='rag-testing'):
+        return error
+    def is_dependency_error(error):
+        return False
+
 try:
     from datasets import load_dataset  # type: ignore
 except ModuleNotFoundError as exc:
+    if is_dependency_error(exc):
+        enhanced_error = handle_dependency_error(exc)
+        raise type(exc)(str(enhanced_error)) from exc
     raise ModuleNotFoundError(
         "Missing dependency 'datasets'. Install it with `pip install datasets`."
     ) from exc
-
-CURRENT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = CURRENT_DIR.parent
 
 for candidate in (
     PROJECT_ROOT / "RAGSystem.py",

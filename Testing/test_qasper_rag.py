@@ -16,15 +16,31 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# Add project root to path for error handler utilities
+CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# Import error handler utilities
+try:
+    from error_handler_utils import handle_dependency_error, is_dependency_error
+except ImportError:
+    # Fallback if utility module is not available
+    def handle_dependency_error(error, conda_env='rag-testing'):
+        return error
+    def is_dependency_error(error):
+        return False
+
 try:
     from datasets import load_dataset  # type: ignore
 except ModuleNotFoundError as exc:
+    if is_dependency_error(exc):
+        enhanced_error = handle_dependency_error(exc)
+        raise type(exc)(str(enhanced_error)) from exc
     raise ModuleNotFoundError(
         "Missing dependency 'datasets'. Install it with `pip install datasets`."
     ) from exc
-
-CURRENT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = CURRENT_DIR.parent
 
 # RAG system imports will be loaded dynamically based on --rag-system argument
 RAGConfig = None
@@ -101,14 +117,17 @@ def load_rag_system(rag_system_name: str) -> None:
         try:
             spec.loader.exec_module(module)
         except ImportError as e:
-            # Provide helpful error message if vLLM is missing
-            error_str = str(e).lower()
-            if "vllm" in error_str or "vllm is required" in error_str:
-                raise ImportError(
-                    f"Self-RAG requires vLLM which is not installed.\n"
-                    f"Install it with: pip install vllm\n"
-                    f"Or use naive-rag instead by setting --rag-system naive-rag"
-                ) from e
+            # Check if it's a dependency error and enhance the message
+            if is_dependency_error(e):
+                enhanced_error = handle_dependency_error(e)
+                error_str = str(e).lower()
+                if "vllm" in error_str or "vllm is required" in error_str:
+                    raise ImportError(
+                        f"Self-RAG requires vLLM which is not installed.\n"
+                        f"{str(enhanced_error)}\n"
+                        f"Or use naive-rag instead by setting --rag-system naive-rag"
+                    ) from e
+                raise type(e)(str(enhanced_error)) from e
             raise
         
         RAGConfig = module.RAGConfig
@@ -442,7 +461,12 @@ def main() -> None:
             continue
         
         # Build index
-        rag_system.retriever.build_index(documents, doc_metadata)
+        # For self-rag, build_index is on the RAGSystem itself, not on retriever
+        # For naive-rag, build_index is on the retriever
+        if args.rag_system == "self-rag":
+            rag_system.build_index(documents, doc_metadata)
+        else:
+            rag_system.retriever.build_index(documents, doc_metadata)
         logger.info(
             "Indexed %d chunks for article %s (%s)",
             len(documents),

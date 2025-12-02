@@ -14,6 +14,20 @@ CURRENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_DIR.parent
 DATABASE_DIR = CURRENT_DIR / "Database"
 
+# Add project root to path for error handler utilities
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# Import error handler utilities
+try:
+    from error_handler_utils import handle_dependency_error, is_dependency_error
+except ImportError:
+    # Fallback if utility module is not available
+    def handle_dependency_error(error, conda_env='rag-testing'):
+        return error
+    def is_dependency_error(error):
+        return False
+
 # Ensure the RAGSystem module is importable regardless of project layout.
 for candidate in (
     PROJECT_ROOT / "RAGSystem.py",
@@ -25,7 +39,14 @@ for candidate in (
         if module_dir not in sys.path:
             sys.path.insert(0, module_dir)
 
-from RAGSystem import RAGSystem, RAGConfig, setup_logging, check_gpu_availability
+try:
+    from RAGSystem import RAGSystem, RAGConfig, setup_logging, check_gpu_availability
+except (ImportError, ModuleNotFoundError) as e:
+    if is_dependency_error(e):
+        enhanced_error = handle_dependency_error(e)
+        logging.error(str(enhanced_error))
+        print(str(enhanced_error), file=sys.stderr)
+    raise
 
 # Initialize RAG system
 rag_system = None
@@ -55,7 +76,12 @@ def initialize_rag_system():
         return True
         
     except Exception as e:
-        logging.error(f"Failed to initialize RAG system: {e}")
+        if is_dependency_error(e):
+            enhanced_error = handle_dependency_error(e)
+            logging.error(str(enhanced_error))
+            print(str(enhanced_error), file=sys.stderr)
+        else:
+            logging.error(f"Failed to initialize RAG system: {e}")
         return False
 
 app = Flask(__name__, static_folder='static')
