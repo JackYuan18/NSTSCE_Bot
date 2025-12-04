@@ -13,6 +13,7 @@ import argparse
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -214,7 +215,7 @@ def parse_args() -> argparse.Namespace:
         "--rag-system",
         choices=["naive-rag", "self-rag"],
         default="naive-rag",
-        help="RAG system to use: 'naive-rag' (default) or 'self-rag'.",
+        help="RAG system to use: 'naive-rag' (default) or 'self-rag'. For multiple systems, call the script multiple times.",
     )
     args = parser.parse_args()
     if args.generator_model.lower() == "chatgpt5" and not args.chatgpt5_api_key:
@@ -488,8 +489,25 @@ def main() -> None:
             
             logger.info("Q%d: %s", total_questions, question_text)
             
-            # Query RAG system
+            # Query RAG system and measure generation time
+            start_time = time.time()
             _, answer, retrieved_metadata = rag_system.query(question_text, k=args.retrieval_k)
+            generation_time = time.time() - start_time
+            
+            # Get device information from RAG system
+            device_used = getattr(rag_system.config, 'device', 'cpu')
+            if device_used == 'cuda':
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        gpu_name = torch.cuda.get_device_name(0)
+                        device_display = f"GPU ({gpu_name})"
+                    else:
+                        device_display = "CPU (CUDA requested but not available)"
+                except (ImportError, AttributeError):
+                    device_display = "CPU"
+            else:
+                device_display = "CPU"
             
             # Calculate metrics
             reference_answers = extract_reference_answers(example.get("answers"))
@@ -535,6 +553,8 @@ def main() -> None:
                 "f1_score": f1_score,
                 "recall_score": recall_score,
                 "rouge_l_score": rouge_l_score,
+                "generation_time": generation_time,  # Time taken to generate answer in seconds
+                "device": device_display,  # Device used (GPU or CPU)
             }
             # For LongBench, also store the sub-dataset name for reference
             if dataset_name == "longbench" and record.get("dataset"):

@@ -261,6 +261,82 @@ def run_multiple_datasets(options: argparse.Namespace, datasets: List[str]) -> s
     )
 
 
+def run_multiple_rag_systems(options: argparse.Namespace, rag_systems: List[str]) -> subprocess.CompletedProcess[str]:
+    """Run test script for multiple RAG systems sequentially and combine results."""
+    if not DEFAULT_TEST_SCRIPT.exists():
+        raise FileNotFoundError(f"Cannot locate test script at {DEFAULT_TEST_SCRIPT}")
+
+    all_results: List[Dict[str, Any]] = []
+    combined_output = []
+    combined_error = []
+    last_returncode = 0
+
+    # Ensure RESULTS_PATH is absolute
+    results_path_abs = RESULTS_PATH.resolve()
+    results_path_abs.parent.mkdir(parents=True, exist_ok=True)
+
+    # Clear results file at the start
+    clear_results_file()
+
+    for idx, rag_system in enumerate(rag_systems):
+        app.logger.info("Running tests for RAG system %d/%d: %s", idx + 1, len(rag_systems), rag_system)
+        RUN_STATE["message"] = f"Test in progress... Running RAG system {idx + 1}/{len(rag_systems)}: {rag_system}..."
+        
+        # Create options for this RAG system
+        rag_options = argparse.Namespace(**vars(options))
+        rag_options.rag_system = rag_system
+        
+        # Run test for this RAG system (this will write to RESULTS_PATH)
+        result = run_test_script(rag_options)
+        
+        # Collect output
+        if result.stdout:
+            combined_output.append(f"\n=== RAG System: {rag_system} ===\n")
+            combined_output.append(result.stdout)
+        if result.stderr:
+            combined_error.append(f"\n=== RAG System: {rag_system} ===\n")
+            combined_error.append(result.stderr)
+        
+        # Update last returncode (keep error if any RAG system fails)
+        if result.returncode != 0:
+            last_returncode = result.returncode
+        
+        # Load results from this RAG system run and add to combined results
+        try:
+            if results_path_abs.exists():
+                with results_path_abs.open("r", encoding="utf-8") as f:
+                    rag_results = json.load(f)
+                    if isinstance(rag_results, list):
+                        all_results.extend(rag_results)
+                        app.logger.info("Loaded %d results from RAG system %s (total: %d)", len(rag_results), rag_system, len(all_results))
+                    else:
+                        app.logger.warning("Results file for RAG system %s does not contain a list", rag_system)
+            else:
+                app.logger.warning("Results file not found after RAG system %s run: %s", rag_system, results_path_abs)
+        except Exception as exc:
+            app.logger.error("Failed to load results for RAG system %s: %s", rag_system, exc)
+    
+    # Save combined results
+    try:
+        results_path_abs.parent.mkdir(parents=True, exist_ok=True)
+        with results_path_abs.open("w", encoding="utf-8") as f:
+            json.dump(all_results, f, ensure_ascii=False, indent=2)
+        app.logger.info("Combined %d results from %d RAG systems into %s", len(all_results), len(rag_systems), results_path_abs)
+        if not all_results:
+            app.logger.warning("No results collected from any RAG system!")
+    except Exception as exc:
+        app.logger.error("Failed to save combined results to %s: %s", results_path_abs, exc)
+        raise
+    
+    # Return combined result
+    return subprocess.CompletedProcess(
+        args=[],
+        returncode=last_returncode,
+        stdout="".join(combined_output),
+        stderr="".join(combined_error),
+    )
+
+
 def start_test_run(options: argparse.Namespace, *, async_run: bool = True) -> bool:
     if not RUN_LOCK.acquire(blocking=False):
         app.logger.warning("Cannot start test run: another run is already in progress")
@@ -276,10 +352,14 @@ def start_test_run(options: argparse.Namespace, *, async_run: bool = True) -> bo
     def runner() -> None:
         try:
             app.logger.info("Test runner thread started")
-            # Check if multiple datasets are requested
+            # Check if multiple RAG systems are requested
+            rag_systems = getattr(options, "rag_systems", None)
             datasets = getattr(options, "datasets", None)
-            app.logger.info("Datasets attribute: %s (type: %s)", datasets, type(datasets))
-            if datasets and isinstance(datasets, list) and len(datasets) > 1:
+            
+            if rag_systems and isinstance(rag_systems, list) and len(rag_systems) > 1:
+                app.logger.info("Running multiple RAG systems: %s", rag_systems)
+                result = run_multiple_rag_systems(options, rag_systems)
+            elif datasets and isinstance(datasets, list) and len(datasets) > 1:
                 app.logger.info("Running multiple datasets: %s", datasets)
                 result = run_multiple_datasets(options, datasets)
             else:
@@ -485,10 +565,13 @@ TEMPLATE = """
     .tab-stat-value { color: #212529; font-weight: 600; }
     .tab-content { padding: 0; display: none; }
     .tab-content.expanded { display: block; }
-    .tab-results-table { width: 100%; border-collapse: collapse; background: #fff; }
-    .tab-results-table th, .tab-results-table td { padding: 0.85rem; border-bottom: 1px solid #dee2e6; vertical-align: top; }
+    .tab-results-table { width: 100%; border-collapse: collapse; background: #fff; table-layout: fixed; }
+    .tab-results-table th, .tab-results-table td { padding: 0.85rem; border-bottom: 1px solid #dee2e6; vertical-align: top; position: relative; box-sizing: border-box; overflow: hidden; }
     .tab-results-table th { background: #f8f9fa; text-align: left; font-weight: 600; }
     .tab-results-table tbody tr:nth-child(even) { background: #fefefe; }
+    .resize-handle { position: absolute; top: 0; right: -2px; width: 5px; height: 100%; cursor: col-resize; background: #000000; z-index: 10; }
+    .resize-handle:hover { background: #333333; }
+    .resize-handle.active { background: #000000; }
     .tab-empty-state { padding: 2rem; text-align: center; color: #6c757d; }
     .summary-table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
     .summary-table th, .summary-table td { padding: 0.75rem; text-align: left; border-bottom: 1px solid #dee2e6; }
@@ -516,10 +599,11 @@ TEMPLATE = """
       &nbsp;|&nbsp; <strong>Questions/article:</strong> <code id="config-questions_per_article" class="config-value">{{ config.questions_per_article }}</code>
       &nbsp;|&nbsp; <strong>Split:</strong> <code id="config-split" class="config-value">{{ config.split }}</code>
       &nbsp;|&nbsp; <strong>Datasets:</strong> <code id="config-dataset" class="config-value">{{ config.datasets or config.dataset }}</code>
-      &nbsp;|&nbsp; <strong>RAG System:</strong> <code id="config-rag_system" class="config-value">{{ config.rag_system }}</code>
+      &nbsp;|&nbsp; <strong>RAG Systems:</strong> <code id="config-rag_system" class="config-value">{{ config.rag_systems or config.rag_system }}</code>
       &nbsp;|&nbsp; <strong>Show context:</strong> <code id="config-show_context" class="config-value">{{ 'Yes' if config.show_context else 'No' }}</code>
     </p>
     <p>Total questions processed: <strong id="total-questions">0</strong></p>
+    <p id="device-info" style="font-size: 0.9rem; color: #6c757d; margin-top: 0.25rem;">Device: <span id="device-display">-</span></p>
   </div>
   <div class="config-form" id="config-form">
     <label style="display: flex; flex-direction: column; gap: 0.5rem;">
@@ -563,12 +647,18 @@ TEMPLATE = """
         </label>
       </div>
     </label>
-    <label for="input-rag_system">
-      RAG System
-      <select id="input-rag_system" name="rag_system" class="param-input" data-default="{{ config.rag_system }}" data-type="string" data-target="config-rag_system">
-        <option value="naive-rag" {% if config.rag_system == 'naive-rag' %}selected{% endif %}>Naive RAG</option>
-        <option value="self-rag" {% if config.rag_system == 'self-rag' %}selected{% endif %}>Self-RAG</option>
-      </select>
+    <label style="display: flex; flex-direction: column; gap: 0.5rem;">
+      <span style="font-size: 0.95rem; color: #495057; font-weight: 500;">RAG Systems</span>
+      <div style="display: flex; flex-direction: column; gap: 0.4rem;">
+        <label style="flex-direction: row; align-items: center; gap: 0.5rem; cursor: pointer;">
+          <input type="checkbox" id="input-rag_system-naive" name="rag_systems" value="naive-rag" class="rag-system-checkbox" {% if config.rag_system == 'naive-rag' or (config.rag_systems and 'naive-rag' in config.rag_systems) %}checked{% endif %}>
+          <span>Naive RAG</span>
+        </label>
+        <label style="flex-direction: row; align-items: center; gap: 0.5rem; cursor: pointer;">
+          <input type="checkbox" id="input-rag_system-self" name="rag_systems" value="self-rag" class="rag-system-checkbox" {% if config.rag_system == 'self-rag' or (config.rag_systems and 'self-rag' in config.rag_systems) %}checked{% endif %}>
+          <span>Self-RAG</span>
+        </label>
+      </div>
     </label>
     <label for="input-generator_model">
       Generator
@@ -621,6 +711,7 @@ TEMPLATE = """
     const datasetTabsContainer = document.getElementById('dataset-tabs-container');
     const emptyStateContainer = document.getElementById('empty-state-container');
     const totalQuestions = document.getElementById('total-questions');
+    const deviceInfo = document.getElementById('device-display');
     const generatorSelect = document.getElementById('input-generator_model');
     const apiKeyField = document.getElementById('chatgpt5-key-field');
     const apiKeyInput = document.getElementById('input-chatgpt5_api_key');
@@ -628,6 +719,7 @@ TEMPLATE = """
     const apiKeyStatus = document.getElementById('api-key-status');
     const paramInputs = Array.from(document.querySelectorAll('.param-input'));
     const datasetCheckboxes = Array.from(document.querySelectorAll('.dataset-checkbox'));
+    const ragSystemCheckboxes = Array.from(document.querySelectorAll('.rag-system-checkbox'));
     let renderedCount = 0;
     
     console.log('Button element:', runButton);
@@ -669,6 +761,31 @@ TEMPLATE = """
     });
     updateDatasetDisplay();
 
+    function updateRAGSystemDisplay() {
+      const checked = Array.from(ragSystemCheckboxes)
+        .filter(cb => cb.checked)
+        .map(cb => cb.value);
+      const target = document.getElementById('config-rag_system');
+      if (target) {
+        const displayText = checked.map(r => {
+          if (r === 'naive-rag') return 'Naive RAG';
+          if (r === 'self-rag') return 'Self-RAG';
+          return r;
+        }).join(', ') || 'None';
+        target.textContent = displayText;
+        const defaultRAGSystems = Array.from(ragSystemCheckboxes)
+          .filter(cb => cb.hasAttribute('checked'))
+          .map(cb => cb.value);
+        const isModified = JSON.stringify(checked.sort()) !== JSON.stringify(defaultRAGSystems.sort());
+        target.classList.toggle('modified', isModified);
+      }
+    }
+
+    ragSystemCheckboxes.forEach((checkbox) => {
+      checkbox.addEventListener('change', updateRAGSystemDisplay);
+    });
+    updateRAGSystemDisplay();
+
     function applyInputAppearance(input) {
       const defaultValue = input.dataset.default ?? '';
       const targetId = input.dataset.target;
@@ -692,8 +809,15 @@ TEMPLATE = """
         } else if (targetId === 'config-show_context') {
           displayValue = displayValue === 'true' ? 'Yes' : 'No';
         } else if (targetId === 'config-rag_system') {
-          // Display RAG system name
-          if (displayValue === 'naive-rag') {
+          // Display RAG system names (handled by updateRAGSystemDisplay)
+          // This is a fallback for non-checkbox updates
+          if (Array.isArray(displayValue)) {
+            displayValue = displayValue.map(r => {
+              if (r === 'naive-rag') return 'Naive RAG';
+              if (r === 'self-rag') return 'Self-RAG';
+              return r;
+            }).join(', ');
+          } else if (displayValue === 'naive-rag') {
             displayValue = 'Naive RAG';
           } else if (displayValue === 'self-rag') {
             displayValue = 'Self-RAG';
@@ -855,48 +979,266 @@ TEMPLATE = """
 
     let renderedResultsByDataset = {};
     const tabExpandedState = {}; // Track expanded/collapsed state for each dataset
+    const columnWidthsState = {}; // Track column widths for each dataset table: { dataset: [width1, width2, ...] }
 
-    function appendResultRowToTable(tbody, item) {
+    function setupColumnResizing(table) {
+      const resizeHandles = table.querySelectorAll('.resize-handle');
+      let isResizing = false;
+      let currentColumn = null;
+      let nextColumn = null;
+      let startX = 0;
+      let startLeftWidth = 0;
+      let startRightWidth = 0;
+      let columnIndex = -1;
+      let allHeaders = [];
+      let allRows = [];
+
+      function setColumnWidth(column, width) {
+        const widthPx = width + 'px';
+        // Use !important via setProperty to override any CSS
+        column.style.setProperty('width', widthPx, 'important');
+        column.style.setProperty('min-width', widthPx, 'important');
+        column.style.setProperty('max-width', widthPx, 'important');
+        column.style.setProperty('flex-shrink', '0', 'important');
+        column.style.setProperty('flex-grow', '0', 'important');
+        // Store width in data attribute for persistence
+        column.dataset.resizedWidth = width;
+      }
+
+      function updateColumnWidths(leftWidth, rightWidth) {
+        // Update header cells
+        if (currentColumn) {
+          setColumnWidth(currentColumn, leftWidth);
+        }
+        if (nextColumn) {
+          setColumnWidth(nextColumn, rightWidth);
+        }
+        
+        // Update all body cells in these columns
+        allRows.forEach((row) => {
+          const cells = Array.from(row.querySelectorAll('td'));
+          if (cells[columnIndex]) {
+            setColumnWidth(cells[columnIndex], leftWidth);
+          }
+          if (nextColumn && cells[columnIndex + 1]) {
+            setColumnWidth(cells[columnIndex + 1], rightWidth);
+          }
+        });
+      }
+
+      resizeHandles.forEach((handle) => {
+        handle.addEventListener('mousedown', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          
+          isResizing = true;
+          currentColumn = handle.parentElement;
+          columnIndex = parseInt(handle.dataset.columnIndex);
+          allHeaders = Array.from(table.querySelectorAll('thead th'));
+          allRows = Array.from(table.querySelectorAll('tbody tr'));
+          
+          // Find next column
+          if (columnIndex < allHeaders.length - 1) {
+            nextColumn = allHeaders[columnIndex + 1];
+          } else {
+            nextColumn = null;
+          }
+          
+          // Convert all columns to pixel widths to prevent recalculation
+          allHeaders.forEach((th, idx) => {
+            const currentWidth = th.getBoundingClientRect().width;
+            const widthPx = currentWidth + 'px';
+            th.style.width = widthPx;
+            th.style.minWidth = widthPx;
+            th.style.maxWidth = widthPx;
+            // Update all cells in this column
+            allRows.forEach((row) => {
+              const cells = Array.from(row.querySelectorAll('td'));
+              if (cells[idx]) {
+                cells[idx].style.width = widthPx;
+                cells[idx].style.minWidth = widthPx;
+                cells[idx].style.maxWidth = widthPx;
+              }
+            });
+          });
+          
+          // Get initial widths in pixels
+          startX = e.clientX;
+          startLeftWidth = currentColumn.getBoundingClientRect().width;
+          if (nextColumn) {
+            startRightWidth = nextColumn.getBoundingClientRect().width;
+          }
+          
+          handle.classList.add('active');
+          document.body.style.cursor = 'col-resize';
+          document.body.style.userSelect = 'none';
+          
+          // Prevent text selection during resize
+          document.addEventListener('selectstart', preventSelection);
+        });
+      });
+
+      function preventSelection(e) {
+        if (isResizing) {
+          e.preventDefault();
+        }
+      }
+
+      function handleMouseMove(e) {
+        if (!isResizing || !currentColumn) return;
+        
+        e.preventDefault();
+        e.stopPropagation();
+        
+        const diff = e.clientX - startX;
+        const newLeftWidth = Math.max(1, startLeftWidth + diff);
+        const newRightWidth = nextColumn ? Math.max(1, startRightWidth - diff) : startRightWidth;
+        
+        // Apply new widths immediately
+        updateColumnWidths(newLeftWidth, newRightWidth);
+        
+        // Prevent default browser behavior that might interfere
+        return false;
+      }
+
+      function handleMouseUp(e) {
+        if (isResizing) {
+          // Calculate final widths from mouse position (more accurate than getBoundingClientRect)
+          const finalX = e ? e.clientX : (window.event ? window.event.clientX : startX);
+          const diff = finalX - startX;
+          const finalLeftWidth = Math.max(1, startLeftWidth + diff);
+          const finalRightWidth = nextColumn ? Math.max(1, startRightWidth - diff) : 0;
+          
+          // Lock in the final widths
+          updateColumnWidths(finalLeftWidth, finalRightWidth);
+          
+          // Save column widths to state for persistence
+          const tableContainer = table.closest('.dataset-tab');
+          if (tableContainer) {
+            const datasetId = tableContainer.id.replace('tab-', '');
+            const allHeaders = Array.from(table.querySelectorAll('thead th'));
+            const savedWidths = allHeaders.map(th => {
+              const width = th.style.width || th.getBoundingClientRect().width + 'px';
+              return width;
+            });
+            columnWidthsState[datasetId] = savedWidths;
+          }
+          
+          // Force a reflow to ensure styles are applied
+          table.offsetHeight;
+          
+          // Clean up
+          if (currentColumn) {
+            const handle = currentColumn.querySelector('.resize-handle');
+            if (handle) {
+              handle.classList.remove('active');
+            }
+          }
+          
+          isResizing = false;
+          document.body.style.cursor = '';
+          document.body.style.userSelect = '';
+          document.removeEventListener('selectstart', preventSelection);
+          currentColumn = null;
+          nextColumn = null;
+          columnIndex = -1;
+          allHeaders = [];
+          allRows = [];
+        }
+      }
+
+      document.addEventListener('mousemove', handleMouseMove);
+      document.addEventListener('mouseup', handleMouseUp);
+      
+      // Also handle mouseleave to ensure cleanup
+      document.addEventListener('mouseleave', handleMouseUp);
+    }
+
+    function appendResultRowToTable(tbody, questionKey, questionResults) {
+      // questionResults is an array of results for the same question
+      const firstResult = questionResults[0];
       const row = document.createElement('tr');
+      
+      // Article cell (same for all results)
       const articleCell = document.createElement('td');
-      articleCell.innerHTML = '<div class="badge">ID: ' + (item.article_id || 'N/A') + '</div><div>' + (item.title || 'Unknown title') + '</div>';
+      articleCell.innerHTML = '<div class="badge">ID: ' + (firstResult.article_id || 'N/A') + '</div><div>' + (firstResult.title || 'Unknown title') + '</div>';
+      
+      // Question cell (same for all results)
       const questionCell = document.createElement('td');
       questionCell.className = 'question';
-      questionCell.textContent = item.question || '';
+      questionCell.textContent = firstResult.question || '';
+      
+      // Answer cell - show multiple answers in separate rows
       const answerCell = document.createElement('td');
       answerCell.className = 'answer';
-      const answerText = document.createElement('div');
-      answerText.textContent = item.generated_answer || '';
-      answerCell.appendChild(answerText);
-      const showContext = document.getElementById('input-show_context')?.checked !== false;
-      if (Array.isArray(item.retrieved_context) && item.retrieved_context.length > 0 && showContext) {
-        const contextDiv = document.createElement('div');
-        contextDiv.className = 'context';
-        const contextTitle = document.createElement('strong');
-        contextTitle.textContent = 'Retrieved Context:';
-        contextDiv.appendChild(contextTitle);
-        const maxPreview = Math.min(item.retrieved_context.length, 3);
-        for (let i = 0; i < maxPreview; i++) {
-          const ctx = item.retrieved_context[i] || {};
-          const ctxDiv = document.createElement('div');
-          ctxDiv.className = 'context-item';
-          const section = ctx.section_title || 'Unknown Section';
-          const para = ctx.paragraph_index !== undefined && ctx.paragraph_index !== null ? ctx.paragraph_index : '?';
-          ctxDiv.innerHTML = '<em>' + section + ' ¶' + para + '</em><br>' + (ctx.text_preview || (ctx.chunk ? ctx.chunk.slice(0, 200) + (ctx.chunk.length > 200 ? '...' : '') : ''));
-          contextDiv.appendChild(ctxDiv);
+      questionResults.forEach((item, idx) => {
+        const answerDiv = document.createElement('div');
+        answerDiv.style.marginBottom = idx < questionResults.length - 1 ? '1rem' : '0';
+        answerDiv.style.paddingBottom = idx < questionResults.length - 1 ? '1rem' : '0';
+        answerDiv.style.borderBottom = idx < questionResults.length - 1 ? '1px solid #dee2e6' : 'none';
+        
+        // RAG system label
+        const ragSystemLabel = document.createElement('div');
+        ragSystemLabel.style.fontWeight = '600';
+        ragSystemLabel.style.color = '#495057';
+        ragSystemLabel.style.marginBottom = '0.5rem';
+        ragSystemLabel.style.fontSize = '0.9rem';
+        const ragSystemName = item.rag_system === 'naive-rag' ? 'Naive RAG' : (item.rag_system === 'self-rag' ? 'Self-RAG' : item.rag_system || 'Unknown');
+        
+        // Add generation time if available
+        let ragSystemText = ragSystemName + ':';
+        if (item.generation_time !== null && item.generation_time !== undefined && !isNaN(item.generation_time)) {
+          const timeSeconds = item.generation_time;
+          if (timeSeconds < 1) {
+            ragSystemText += ` <span style="font-weight: 400; color: #6c757d; font-size: 0.85rem;">(${(timeSeconds * 1000).toFixed(0)}ms)</span>`;
+          } else {
+            ragSystemText += ` <span style="font-weight: 400; color: #6c757d; font-size: 0.85rem;">(${timeSeconds.toFixed(2)}s)</span>`;
+          }
         }
-        if (item.retrieved_context.length > 3) {
-          const moreDiv = document.createElement('div');
-          moreDiv.className = 'context-item';
-          moreDiv.innerHTML = '<em>+ ' + (item.retrieved_context.length - 3) + ' more chunks</em>';
-          contextDiv.appendChild(moreDiv);
+        ragSystemLabel.innerHTML = ragSystemText;
+        answerDiv.appendChild(ragSystemLabel);
+        
+        // Answer text
+        const answerText = document.createElement('div');
+        answerText.textContent = item.generated_answer || '';
+        answerDiv.appendChild(answerText);
+        
+        // Context (if enabled)
+        const showContext = document.getElementById('input-show_context')?.checked !== false;
+        if (Array.isArray(item.retrieved_context) && item.retrieved_context.length > 0 && showContext) {
+          const contextDiv = document.createElement('div');
+          contextDiv.className = 'context';
+          contextDiv.style.marginTop = '0.5rem';
+          const contextTitle = document.createElement('strong');
+          contextTitle.textContent = 'Retrieved Context:';
+          contextDiv.appendChild(contextTitle);
+          const maxPreview = Math.min(item.retrieved_context.length, 3);
+          for (let i = 0; i < maxPreview; i++) {
+            const ctx = item.retrieved_context[i] || {};
+            const ctxDiv = document.createElement('div');
+            ctxDiv.className = 'context-item';
+            const section = ctx.section_title || 'Unknown Section';
+            const para = ctx.paragraph_index !== undefined && ctx.paragraph_index !== null ? ctx.paragraph_index : '?';
+            ctxDiv.innerHTML = '<em>' + section + ' ¶' + para + '</em><br>' + (ctx.text_preview || (ctx.chunk ? ctx.chunk.slice(0, 200) + (ctx.chunk.length > 200 ? '...' : '') : ''));
+            contextDiv.appendChild(ctxDiv);
+          }
+          if (item.retrieved_context.length > 3) {
+            const moreDiv = document.createElement('div');
+            moreDiv.className = 'context-item';
+            moreDiv.innerHTML = '<em>+ ' + (item.retrieved_context.length - 3) + ' more chunks</em>';
+            contextDiv.appendChild(moreDiv);
+          }
+          answerDiv.appendChild(contextDiv);
         }
-        answerCell.appendChild(contextDiv);
-      }
+        
+        answerCell.appendChild(answerDiv);
+      });
+      
+      // Reference answers cell (same for all results)
       const refCell = document.createElement('td');
-      if (Array.isArray(item.reference_answers) && item.reference_answers.length > 0) {
+      if (Array.isArray(firstResult.reference_answers) && firstResult.reference_answers.length > 0) {
         const list = document.createElement('ul');
-        for (const ref of item.reference_answers) {
+        for (const ref of firstResult.reference_answers) {
           const li = document.createElement('li');
           li.textContent = ref;
           list.appendChild(li);
@@ -907,24 +1249,49 @@ TEMPLATE = """
         placeholder.textContent = 'No reference answers provided.';
         refCell.appendChild(placeholder);
       }
+      
+      // Score cell - show multiple scores in separate rows
       const scoreCell = document.createElement('td');
-      const scoreParts = [];
-      if (item.exact_match !== null && item.exact_match !== undefined) {
-        scoreParts.push('<strong>EM:</strong> ' + formatMetricValue(item.exact_match));
-      }
-      if (item.f1_score !== null && item.f1_score !== undefined) {
-        scoreParts.push('<strong>F1:</strong> ' + formatMetricValue(item.f1_score));
-      }
-      if (item.recall_score !== null && item.recall_score !== undefined) {
-        scoreParts.push('<strong>Recall:</strong> ' + formatMetricValue(item.recall_score));
-      }
-      if (item.rouge_l_score !== null && item.rouge_l_score !== undefined) {
-        scoreParts.push('<strong>R-L:</strong> ' + formatMetricValue(item.rouge_l_score));
-      }
-      if (item.bleu_score !== null && item.bleu_score !== undefined) {
-        scoreParts.push('<strong>BLEU:</strong> ' + formatMetricValue(item.bleu_score));
-      }
-      scoreCell.innerHTML = scoreParts.length > 0 ? scoreParts.join('<br>') : '<em>No scores</em>';
+      questionResults.forEach((item, idx) => {
+        const scoreDiv = document.createElement('div');
+        scoreDiv.style.marginBottom = idx < questionResults.length - 1 ? '1rem' : '0';
+        scoreDiv.style.paddingBottom = idx < questionResults.length - 1 ? '1rem' : '0';
+        scoreDiv.style.borderBottom = idx < questionResults.length - 1 ? '1px solid #dee2e6' : 'none';
+        
+        // RAG system label
+        const ragSystemLabel = document.createElement('div');
+        ragSystemLabel.style.fontWeight = '600';
+        ragSystemLabel.style.color = '#495057';
+        ragSystemLabel.style.marginBottom = '0.5rem';
+        ragSystemLabel.style.fontSize = '0.9rem';
+        const ragSystemName = item.rag_system === 'naive-rag' ? 'Naive RAG' : (item.rag_system === 'self-rag' ? 'Self-RAG' : item.rag_system || 'Unknown');
+        ragSystemLabel.textContent = ragSystemName + ':';
+        scoreDiv.appendChild(ragSystemLabel);
+        
+        // Scores
+        const scoreParts = [];
+        if (item.exact_match !== null && item.exact_match !== undefined) {
+          scoreParts.push('<strong>EM:</strong> ' + formatMetricValue(item.exact_match));
+        }
+        if (item.f1_score !== null && item.f1_score !== undefined) {
+          scoreParts.push('<strong>F1:</strong> ' + formatMetricValue(item.f1_score));
+        }
+        if (item.recall_score !== null && item.recall_score !== undefined) {
+          scoreParts.push('<strong>Recall:</strong> ' + formatMetricValue(item.recall_score));
+        }
+        if (item.rouge_l_score !== null && item.rouge_l_score !== undefined) {
+          scoreParts.push('<strong>R-L:</strong> ' + formatMetricValue(item.rouge_l_score));
+        }
+        if (item.bleu_score !== null && item.bleu_score !== undefined) {
+          scoreParts.push('<strong>BLEU:</strong> ' + formatMetricValue(item.bleu_score));
+        }
+        const scoreContent = document.createElement('div');
+        scoreContent.innerHTML = scoreParts.length > 0 ? scoreParts.join('<br>') : '<em>No scores</em>';
+        scoreDiv.appendChild(scoreContent);
+        
+        scoreCell.appendChild(scoreDiv);
+      });
+      
       row.appendChild(articleCell);
       row.appendChild(questionCell);
       row.appendChild(answerCell);
@@ -1088,18 +1455,68 @@ TEMPLATE = """
           const thead = document.createElement('thead');
           const headerRow = document.createElement('tr');
           const headers = ['Article', 'Question', 'Generated Answer', 'Reference Answers', 'Score'];
-          headers.forEach(h => {
+          const defaultWidths = ['15%', '20%', '35%', '15%', '15%']; // Default column widths
+          
+          // Restore saved column widths if available
+          const savedWidths = columnWidthsState[dataset];
+          const widthsToUse = savedWidths || defaultWidths;
+          
+          headers.forEach((h, idx) => {
             const th = document.createElement('th');
             th.textContent = h;
+            th.style.width = widthsToUse[idx];
+            // If using saved pixel widths, also set min/max
+            if (savedWidths && savedWidths[idx] && savedWidths[idx].includes('px')) {
+              th.style.minWidth = savedWidths[idx];
+              th.style.maxWidth = savedWidths[idx];
+            }
+            // Add resize handle (except for last column)
+            if (idx < headers.length - 1) {
+              const resizeHandle = document.createElement('div');
+              resizeHandle.className = 'resize-handle';
+              resizeHandle.dataset.columnIndex = idx;
+              th.appendChild(resizeHandle);
+            }
             headerRow.appendChild(th);
           });
           thead.appendChild(headerRow);
           table.appendChild(thead);
+          
+          // Apply saved widths to body cells if available
+          if (savedWidths) {
+            const tbody = table.querySelector('tbody') || document.createElement('tbody');
+            const allRows = Array.from(tbody.querySelectorAll('tr'));
+            allRows.forEach((row) => {
+              const cells = Array.from(row.querySelectorAll('td'));
+              cells.forEach((cell, idx) => {
+                if (savedWidths[idx]) {
+                  cell.style.width = savedWidths[idx];
+                  if (savedWidths[idx].includes('px')) {
+                    cell.style.minWidth = savedWidths[idx];
+                    cell.style.maxWidth = savedWidths[idx];
+                  }
+                }
+              });
+            });
+          }
+          
+          // Add column resizing functionality
+          setupColumnResizing(table);
 
           const tbody = document.createElement('tbody');
-          // Render all results for this dataset
+          // Group results by question (article_id + question text)
+          const resultsByQuestion = {};
           datasetResults.forEach((result) => {
-            appendResultRowToTable(tbody, result);
+            const questionKey = (result.article_id || '') + '|||' + (result.question || '');
+            if (!resultsByQuestion[questionKey]) {
+              resultsByQuestion[questionKey] = [];
+            }
+            resultsByQuestion[questionKey].push(result);
+          });
+          
+          // Render grouped results
+          Object.keys(resultsByQuestion).forEach((questionKey) => {
+            appendResultRowToTable(tbody, questionKey, resultsByQuestion[questionKey]);
           });
 
           table.appendChild(tbody);
@@ -1140,6 +1557,19 @@ TEMPLATE = """
             totalQuestions.textContent = String(data.length);
           }
           
+          // Extract and display device information from results
+          if (data.length > 0 && deviceInfo) {
+            // Get device from first result (all results should use same device)
+            const firstDevice = data[0].device;
+            if (firstDevice) {
+              deviceInfo.textContent = firstDevice;
+            } else {
+              deviceInfo.textContent = 'Unknown';
+            }
+          } else if (deviceInfo && data.length === 0) {
+            deviceInfo.textContent = '-';
+          }
+          
           // Fetch statistics and render tabs
           fetch('/api/statistics')
             .then((res) => res.json())
@@ -1165,6 +1595,9 @@ TEMPLATE = """
       }
       if (totalQuestions) {
         totalQuestions.textContent = '0';
+      }
+      if (deviceInfo) {
+        deviceInfo.textContent = '-';
       }
     }
 
@@ -1222,12 +1655,23 @@ TEMPLATE = """
           overrides.generator_model = generatorValue;
         }
         
-        // Handle RAG system selection
-        const ragSystemSelect = document.getElementById('input-rag_system');
-        if (ragSystemSelect) {
-          const ragSystemValue = ragSystemSelect.value.trim();
-          // Always include rag_system in overrides to ensure it's passed to the test script
-          overrides.rag_system = ragSystemValue;
+        // Handle multiple RAG system selection from checkboxes
+        const checkedRAGSystems = Array.from(ragSystemCheckboxes)
+          .filter(cb => cb.checked)
+          .map(cb => cb.value);
+        
+        if (checkedRAGSystems.length === 0) {
+          runStatus.textContent = 'Please select at least one RAG system.';
+          runButton.disabled = false;
+          return;
+        }
+        
+        if (checkedRAGSystems.length === 1) {
+          // Single RAG system - use legacy 'rag_system' field for backward compatibility
+          overrides.rag_system = checkedRAGSystems[0];
+        } else {
+          // Multiple RAG systems - use 'rag_systems' array
+          overrides.rag_systems = checkedRAGSystems;
         }
         
         // Handle multiple dataset selection from checkboxes
@@ -1338,6 +1782,7 @@ def index():
             "dataset": default_dataset,  # For backward compatibility
             "datasets": default_datasets if default_datasets else [default_dataset],
             "rag_system": getattr(TEST_OPTIONS, "rag_system", "naive-rag"),
+            "rag_systems": getattr(TEST_OPTIONS, "rag_systems", None),
             "show_context": TEST_OPTIONS.show_context,
         },
     )
@@ -1409,7 +1854,23 @@ def trigger_run():
     if "generator_model" in payload and payload["generator_model"]:
         options_dict["generator_model"] = str(payload["generator_model"]).strip()
 
-    if "rag_system" in payload and payload["rag_system"]:
+    # Handle RAG system selection (single or multiple)
+    if "rag_systems" in payload and isinstance(payload["rag_systems"], list) and payload["rag_systems"]:
+        # Multiple RAG systems
+        rag_systems = [str(r).strip().lower() for r in payload["rag_systems"]]
+        valid_rag_systems = [r for r in rag_systems if r in ("naive-rag", "self-rag")]
+        if valid_rag_systems:
+            if len(valid_rag_systems) == 1:
+                # Single RAG system - use legacy field for compatibility
+                options_dict["rag_system"] = valid_rag_systems[0]
+            else:
+                # Multiple RAG systems
+                options_dict["rag_systems"] = valid_rag_systems
+                options_dict["rag_system"] = valid_rag_systems[0]  # Keep for backward compatibility
+        else:
+            options_dict["rag_system"] = "naive-rag"
+    elif "rag_system" in payload and payload["rag_system"]:
+        # Single RAG system (legacy support)
         rag_system_value = str(payload["rag_system"]).strip().lower()
         if rag_system_value in ("naive-rag", "self-rag"):
             options_dict["rag_system"] = rag_system_value
