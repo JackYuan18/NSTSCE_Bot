@@ -134,8 +134,36 @@ def load_rag_system(rag_system_name: str) -> None:
         RAGConfig = module.RAGConfig
         RAGSystem = module.RAGSystem
         setup_logging = module.setup_logging
+        
+    elif rag_system_name == "flare":
+        # Load FLARE from RAGSystem/FLARE/RAGSystem.py
+        flare_path = PROJECT_ROOT / "RAGSystem" / "FLARE" / "RAGSystem.py"
+        if not flare_path.exists():
+            raise FileNotFoundError(
+                f"FLARE system not found at {flare_path}. "
+                "Please ensure FLARE has a RAGSystem.py file with RAGConfig, RAGSystem, and setup_logging."
+            )
+        
+        # Use importlib to load the module with a unique name
+        spec = importlib.util.spec_from_file_location("flare_system", flare_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Failed to create spec for {flare_path}")
+        
+        module = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(module)
+        except ImportError as e:
+            # Check if it's a dependency error and enhance the message
+            if is_dependency_error(e):
+                enhanced_error = handle_dependency_error(e)
+                raise type(e)(str(enhanced_error)) from e
+            raise
+        
+        RAGConfig = module.RAGConfig
+        RAGSystem = module.RAGSystem
+        setup_logging = module.setup_logging
     else:
-        raise ValueError(f"Unknown RAG system: {rag_system_name}")
+        raise ValueError(f"Unknown RAG system: {rag_system_name}. Choose from: naive-rag, self-rag, flare")
 
 
 def parse_args() -> argparse.Namespace:
@@ -189,6 +217,17 @@ def parse_args() -> argparse.Namespace:
         help="API key required when --generator-model chatgpt5 is selected.",
     )
     parser.add_argument(
+        "--openai-api-key",
+        default=None,
+        help="OpenAI API key required when --rag-system flare is selected.",
+    )
+    parser.add_argument(
+        "--retrieval-instruction-method",
+        default=None,
+        choices=['cot', 'strategyqa', 'summary'],
+        help="RetrievalInstruction method for FLARE: 'cot' (Chain of Thought), 'strategyqa', 'summary'. Omit to disable.",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         help="Logging level (DEBUG, INFO, WARNING, ERROR).",
@@ -213,13 +252,15 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(show_context=True)
     parser.add_argument(
         "--rag-system",
-        choices=["naive-rag", "self-rag"],
+        choices=["naive-rag", "self-rag", "flare"],
         default="naive-rag",
-        help="RAG system to use: 'naive-rag' (default) or 'self-rag'. For multiple systems, call the script multiple times.",
+        help="RAG system to use: 'naive-rag' (default), 'self-rag', or 'flare'. For multiple systems, call the script multiple times.",
     )
     args = parser.parse_args()
     if args.generator_model.lower() == "chatgpt5" and not args.chatgpt5_api_key:
         parser.error("generator_model 'chatgpt5' requires --chatgpt5-api-key.")
+    if args.rag_system == "flare" and not args.openai_api_key:
+        parser.error("RAG system 'flare' requires --openai-api-key.")
     return args
 
 
@@ -358,7 +399,9 @@ def main() -> None:
     logger.info("Using RAG system: %s", args.rag_system)
     
     use_chatgpt5 = args.generator_model.lower() == "chatgpt5"
-    generator_model_name = "t5-small" if use_chatgpt5 else args.generator_model
+    # Keep the generator_model as-is (chatgpt5 or the actual model name)
+    # When chatgpt5 is selected, pass it through so RAG systems know to use ChatGPT5
+    generator_model_name = args.generator_model
     
     logger.info("Using %s generator", "ChatGPT5 via API" if use_chatgpt5 else f"model: {generator_model_name}")
     
@@ -369,13 +412,27 @@ def main() -> None:
     logger.info("Loaded %d records from %s dataset", len(dataset_split), dataset_name)
     
     # Initialize RAG system
-    config = RAGConfig(
-        chunk_size=args.chunk_size,
-        retrieval_k=args.retrieval_k,
-        generator_model=generator_model_name,
-        use_chatgpt5=use_chatgpt5,
-        openai_api_key=args.chatgpt5_api_key if use_chatgpt5 else None,
-    )
+    # For FLARE, use openai_api_key argument; for others, use chatgpt5_api_key if using ChatGPT5
+    openai_api_key = None
+    if args.rag_system == "flare":
+        openai_api_key = args.openai_api_key
+    elif use_chatgpt5:
+        openai_api_key = args.chatgpt5_api_key
+    
+    # Build config arguments - only include retrieval_instruction_method for FLARE
+    config_kwargs = {
+        'chunk_size': args.chunk_size,
+        'retrieval_k': args.retrieval_k,
+        'generator_model': generator_model_name,
+        'use_chatgpt5': use_chatgpt5,
+        'openai_api_key': openai_api_key,
+    }
+    
+    # Only add retrieval_instruction_method for FLARE
+    if args.rag_system == 'flare' and args.retrieval_instruction_method:
+        config_kwargs['retrieval_instruction_method'] = args.retrieval_instruction_method
+    
+    config = RAGConfig(**config_kwargs)
     rag_system = RAGSystem(config)
     
     # Initialize results tracking
@@ -462,9 +519,9 @@ def main() -> None:
             continue
         
         # Build index
-        # For self-rag, build_index is on the RAGSystem itself, not on retriever
+        # For self-rag and flare, build_index is on the RAGSystem itself, not on retriever
         # For naive-rag, build_index is on the retriever
-        if args.rag_system == "self-rag":
+        if args.rag_system in ("self-rag", "flare"):
             rag_system.build_index(documents, doc_metadata)
         else:
             rag_system.retriever.build_index(documents, doc_metadata)

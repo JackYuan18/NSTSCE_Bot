@@ -11,21 +11,54 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
 import threading
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
 from flask import Flask, jsonify, render_template_string, request  # type: ignore
 
 CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR.parent
 DEFAULT_RESULTS_PATH = CURRENT_DIR / "qasper_results.json"
 DEFAULT_TEST_SCRIPT = CURRENT_DIR / "test_qasper_rag.py"
 
+# Set up logging directory
+LOG_DIR = CURRENT_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+# Create log file with timestamp
+LOG_FILE = LOG_DIR / f"qasper_interface_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
 app = Flask(__name__)
+
+# Configure file logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)  # Also log to console
+    ]
+)
+
+# Set Flask app logger level
+app.logger.setLevel(logging.INFO)
+
+# Log startup information
+app.logger.info("=" * 80)
+app.logger.info("QASPER Interface Starting")
+app.logger.info("=" * 80)
+app.logger.info("Log file: %s", LOG_FILE)
+app.logger.info("Working directory: %s", CURRENT_DIR)
+app.logger.info("Python executable: %s", sys.executable)
+app.logger.info("Python version: %s", sys.version)
 
 # Shared state for UI polling
 RUN_LOCK = threading.Lock()
@@ -90,6 +123,12 @@ def run_test_script(options: argparse.Namespace) -> subprocess.CompletedProcess[
     if getattr(options, "chatgpt5_api_key", None):
         cmd.extend(["--chatgpt5-api-key", options.chatgpt5_api_key])
 
+    if getattr(options, "openai_api_key", None):
+        cmd.extend(["--openai-api-key", options.openai_api_key])
+
+    if getattr(options, "retrieval_instruction_method", None):
+        cmd.extend(["--retrieval-instruction-method", options.retrieval_instruction_method])
+
     if getattr(options, "show_context", False):
         cmd.append("--show-context")
     else:
@@ -99,6 +138,13 @@ def run_test_script(options: argparse.Namespace) -> subprocess.CompletedProcess[
     if "--chatgpt5-api-key" in display_cmd:
         try:
             idx = display_cmd.index("--chatgpt5-api-key")
+            if idx + 1 < len(display_cmd):
+                display_cmd[idx + 1] = "****"
+        except ValueError:
+            pass
+    if "--openai-api-key" in display_cmd:
+        try:
+            idx = display_cmd.index("--openai-api-key")
             if idx + 1 < len(display_cmd):
                 display_cmd[idx + 1] = "****"
         except ValueError:
@@ -143,10 +189,40 @@ def run_test_script(options: argparse.Namespace) -> subprocess.CompletedProcess[
                     progress_msg = line[message_start + len("[Self-RAG]"):].strip()
                     # Update RUN_STATE with progress message
                     RUN_STATE["message"] = f"Test in progress... {progress_msg}"
-                    app.logger.debug("Progress: %s", progress_msg)
+                    app.logger.info("Progress: %s", progress_msg)
             
-            # Also log the line
-            app.logger.debug("Test output: %s", line)
+            # Check if this is a [FLARE] log message
+            elif "[FLARE]" in line:
+                # Extract the message after [FLARE]
+                message_start = line.find("[FLARE]")
+                if message_start != -1:
+                    flare_msg = line[message_start + len("[FLARE]"):].strip()
+                    # Update RUN_STATE with progress message
+                    RUN_STATE["message"] = f"Test in progress... {flare_msg}"
+                    # Log FLARE messages at INFO level
+                    app.logger.info("FLARE: %s", flare_msg)
+                else:
+                    # Log the full line if it contains [FLARE]
+                    app.logger.info("FLARE output: %s", line)
+            
+            # Check for ERROR or WARNING in the line (important messages)
+            elif any(level in line.upper() for level in ["ERROR", "WARNING", "CRITICAL", "EXCEPTION"]):
+                # Log errors and warnings at appropriate levels
+                if "ERROR" in line.upper() or "CRITICAL" in line.upper() or "EXCEPTION" in line.upper():
+                    app.logger.error("Test script: %s", line)
+                elif "WARNING" in line.upper():
+                    app.logger.warning("Test script: %s", line)
+                else:
+                    app.logger.info("Test output: %s", line)
+            
+            # Log other important messages at INFO level (not just DEBUG)
+            # This includes INFO level messages from the test script
+            elif "INFO" in line.upper() or any(keyword in line for keyword in ["Processing", "Loading", "Initializing", "Completed", "Finished"]):
+                app.logger.info("Test output: %s", line)
+            
+            # Log everything else at DEBUG level
+            else:
+                app.logger.debug("Test output: %s", line)
         
         # Wait for process to complete
         returncode = process.wait(timeout=3600)
@@ -658,13 +734,19 @@ TEMPLATE = """
           <input type="checkbox" id="input-rag_system-self" name="rag_systems" value="self-rag" class="rag-system-checkbox" {% if config.rag_system == 'self-rag' or (config.rag_systems and 'self-rag' in config.rag_systems) %}checked{% endif %}>
           <span>Self-RAG</span>
         </label>
+        <label style="flex-direction: row; align-items: center; gap: 0.5rem; cursor: pointer;">
+          <input type="checkbox" id="input-rag_system-flare" name="rag_systems" value="flare" class="rag-system-checkbox" {% if config.rag_system == 'flare' or (config.rag_systems and 'flare' in config.rag_systems) %}checked{% endif %}>
+          <span>FLARE</span>
+        </label>
       </div>
     </label>
     <label for="input-generator_model">
       Generator
       <select id="input-generator_model" name="generator_model" class="param-input" data-default="{{ config.generator_model }}" data-type="string" data-target="config-generator">
         <option value="t5-small" {% if config.generator_model == 't5-small' %}selected{% endif %}>Local T5 Small</option>
-        <option value="chatgpt5" {% if config.generator_model == 'chatgpt5' %}selected{% endif %}>ChatGPT 5</option>
+        <option value="chatgpt5" id="option-chatgpt5" {% if config.generator_model == 'chatgpt5' %}selected{% endif %}>ChatGPT 5</option>
+        <option value="gpt-3.5-turbo-instruct" id="option-gpt-3.5-turbo-instruct" {% if config.generator_model == 'gpt-3.5-turbo-instruct' %}selected{% endif %}>OpenAI gpt-3.5-turbo-instruct</option>
+        <option value="text-davinci-003" {% if config.generator_model == 'text-davinci-003' %}selected{% endif %}>OpenAI text-davinci-003</option>
       </select>
     </label>
     <label for="input-retrieval_k">
@@ -684,12 +766,21 @@ TEMPLATE = """
       <input id="input-questions_per_article" type="number" min="0" step="1" name="questions_per_article" class="param-input" value="{{ config.questions_per_article }}" data-default="{{ config.questions_per_article }}" data-type="number" data-target="config-questions_per_article">
     </label>
     <label id="chatgpt5-key-field" for="input-chatgpt5_api_key" style="display: {{ 'flex' if config.generator_model == 'chatgpt5' else 'none' }};">
-      ChatGPT5 API key
+      OpenAI API key
       <div class="api-key-actions">
-        <input id="input-chatgpt5_api_key" type="password" class="api-key-input" placeholder="Enter API key" autocomplete="off">
+        <input id="input-chatgpt5_api_key" type="password" class="api-key-input" placeholder="Enter OpenAI API key" autocomplete="off">
         <button type="button" id="validate-api-key">Validate</button>
         <span id="api-key-status" class="api-key-status"></span>
       </div>
+    </label>
+    <label id="flare-retrieval-instruction-field" for="input-retrieval_instruction_method" style="display: none; flex-direction: column; gap: 0.5rem;">
+      Retrieval Instruction Method
+      <select id="input-retrieval_instruction_method" name="retrieval_instruction_method" class="param-input">
+        <option value="">None (disabled)</option>
+        <option value="cot" selected>CoT (Chain of Thought)</option>
+        <option value="strategyqa">StrategyQA</option>
+        <option value="summary">Summary</option>
+      </select>
     </label>
     <label for="input-show_context" style="flex-direction: row; align-items: center; gap: 0.5rem;">
       <input id="input-show_context" type="checkbox" name="show_context" class="param-input" data-default="{{ 'true' if config.show_context else 'false' }}" data-type="boolean" data-target="config-show_context" {% if config.show_context %}checked{% endif %}>
@@ -770,6 +861,7 @@ TEMPLATE = """
         const displayText = checked.map(r => {
           if (r === 'naive-rag') return 'Naive RAG';
           if (r === 'self-rag') return 'Self-RAG';
+          if (r === 'flare') return 'FLARE';
           return r;
         }).join(', ') || 'None';
         target.textContent = displayText;
@@ -778,6 +870,53 @@ TEMPLATE = """
           .map(cb => cb.value);
         const isModified = JSON.stringify(checked.sort()) !== JSON.stringify(defaultRAGSystems.sort());
         target.classList.toggle('modified', isModified);
+      }
+      // Show/hide FLARE retrieval instruction method field
+      const isFlareSelected = checked.includes('flare');
+      const flareRetrievalInstructionField = document.getElementById('flare-retrieval-instruction-field');
+      if (flareRetrievalInstructionField) {
+        flareRetrievalInstructionField.style.display = isFlareSelected ? 'flex' : 'none';
+      }
+      
+      // Update generator model dropdown when FLARE is selected/deselected
+      if (generatorSelect) {
+        // Get all options in the generator dropdown
+        const generatorOptions = Array.from(generatorSelect.options);
+        const chatgpt5Option = generatorOptions.find(opt => opt.value === 'chatgpt5');
+        const gpt35Option = generatorOptions.find(opt => opt.value === 'gpt-3.5-turbo-instruct');
+        
+        if (isFlareSelected) {
+          // When FLARE is selected, hide/disable the chatgpt5 option
+          if (chatgpt5Option) {
+            chatgpt5Option.style.display = 'none';
+            chatgpt5Option.disabled = true;
+          }
+          // Ensure gpt-3.5-turbo-instruct option exists and select it
+          if (!gpt35Option) {
+            const newOption = document.createElement('option');
+            newOption.value = 'gpt-3.5-turbo-instruct';
+            newOption.id = 'option-gpt-3.5-turbo-instruct';
+            newOption.textContent = 'OpenAI gpt-3.5-turbo-instruct';
+            generatorSelect.appendChild(newOption);
+          }
+          // Set generator to gpt-3.5-turbo-instruct
+          generatorSelect.value = 'gpt-3.5-turbo-instruct';
+          generatorSelect.disabled = false;  // Keep it enabled but show the selected model
+          generatorSelect.title = 'FLARE uses gpt-3.5-turbo-instruct as generator model';
+          applyInputAppearance(generatorSelect);
+          // Update API key field visibility
+          updateGeneratorState();
+        } else {
+          // When FLARE is deselected, show/enable the chatgpt5 option again
+          if (chatgpt5Option) {
+            chatgpt5Option.style.display = '';
+            chatgpt5Option.disabled = false;
+          }
+          generatorSelect.disabled = false;
+          generatorSelect.title = '';
+          // Update API key field visibility
+          updateGeneratorState();
+        }
       }
     }
 
@@ -805,6 +944,10 @@ TEMPLATE = """
           }
           if (displayValue === 'chatgpt5') {
             displayValue = 'ChatGPT 5';
+          } else if (displayValue === 'gpt-3.5-turbo-instruct') {
+            displayValue = 'OpenAI gpt-3.5-turbo-instruct';
+          } else if (displayValue === 'text-davinci-003') {
+            displayValue = 'OpenAI text-davinci-003';
           }
         } else if (targetId === 'config-show_context') {
           displayValue = displayValue === 'true' ? 'Yes' : 'No';
@@ -815,12 +958,15 @@ TEMPLATE = """
             displayValue = displayValue.map(r => {
               if (r === 'naive-rag') return 'Naive RAG';
               if (r === 'self-rag') return 'Self-RAG';
+              if (r === 'flare') return 'FLARE';
               return r;
             }).join(', ');
           } else if (displayValue === 'naive-rag') {
             displayValue = 'Naive RAG';
           } else if (displayValue === 'self-rag') {
             displayValue = 'Self-RAG';
+          } else if (displayValue === 'flare') {
+            displayValue = 'FLARE';
           }
         } else if (targetId === 'config-dataset') {
           // Display selected datasets
@@ -909,7 +1055,7 @@ TEMPLATE = """
         })
         .finally(() => {
           if (validateButton) {
-            validateButton.disabled = generatorSelect && generatorSelect.value !== 'chatgpt5';
+            validateButton.disabled = generatorSelect && generatorSelect.value !== 'chatgpt5' && generatorSelect.value !== 'gpt-3.5-turbo-instruct';
           }
         });
     }
@@ -922,13 +1068,23 @@ TEMPLATE = """
       apiKeyInput.addEventListener('input', () => setApiKeyStatus('', 'api-key-status'));
     }
 
+
     function updateGeneratorState() {
       if (!generatorSelect || !apiKeyField) {
         return;
       }
-      const useChatGPT = generatorSelect.value === 'chatgpt5';
-      apiKeyField.style.display = useChatGPT ? 'flex' : 'none';
-      if (!useChatGPT) {
+      // Check if FLARE is selected
+      const checkedRAGSystems = Array.from(ragSystemCheckboxes)
+        .filter(cb => cb.checked)
+        .map(cb => cb.value);
+      const isFlareSelected = checkedRAGSystems.includes('flare');
+      
+      // Show API key field if chatgpt5 is selected OR if FLARE is selected
+      const useChatGPT = generatorSelect.value === 'chatgpt5' || generatorSelect.value === 'gpt-3.5-turbo-instruct';
+      const shouldShowApiKey = useChatGPT || isFlareSelected;
+      
+      apiKeyField.style.display = shouldShowApiKey ? 'flex' : 'none';
+      if (!shouldShowApiKey) {
         if (apiKeyInput) {
           apiKeyInput.value = '';
         }
@@ -938,7 +1094,7 @@ TEMPLATE = """
         }
       }
       if (validateButton) {
-        validateButton.disabled = !useChatGPT;
+        validateButton.disabled = !shouldShowApiKey;
       }
       applyInputAppearance(generatorSelect);
     }
@@ -1183,7 +1339,7 @@ TEMPLATE = """
         ragSystemLabel.style.color = '#495057';
         ragSystemLabel.style.marginBottom = '0.5rem';
         ragSystemLabel.style.fontSize = '0.9rem';
-        const ragSystemName = item.rag_system === 'naive-rag' ? 'Naive RAG' : (item.rag_system === 'self-rag' ? 'Self-RAG' : item.rag_system || 'Unknown');
+        const ragSystemName = item.rag_system === 'naive-rag' ? 'Naive RAG' : (item.rag_system === 'self-rag' ? 'Self-RAG' : (item.rag_system === 'flare' ? 'FLARE' : item.rag_system || 'Unknown'));
         
         // Add generation time if available
         let ragSystemText = ragSystemName + ':';
@@ -1264,7 +1420,7 @@ TEMPLATE = """
         ragSystemLabel.style.color = '#495057';
         ragSystemLabel.style.marginBottom = '0.5rem';
         ragSystemLabel.style.fontSize = '0.9rem';
-        const ragSystemName = item.rag_system === 'naive-rag' ? 'Naive RAG' : (item.rag_system === 'self-rag' ? 'Self-RAG' : item.rag_system || 'Unknown');
+        const ragSystemName = item.rag_system === 'naive-rag' ? 'Naive RAG' : (item.rag_system === 'self-rag' ? 'Self-RAG' : (item.rag_system === 'flare' ? 'FLARE' : item.rag_system || 'Unknown'));
         ragSystemLabel.textContent = ragSystemName + ':';
         scoreDiv.appendChild(ragSystemLabel);
         
@@ -1692,15 +1848,40 @@ TEMPLATE = """
           // Multiple datasets - use 'datasets' array
           overrides.datasets = checkedDatasets;
         }
-        if (generatorValue === 'chatgpt5') {
+        // Check if FLARE is selected
+        if (checkedRAGSystems.includes('flare')) {
+          // FLARE uses gpt-3.5-turbo-instruct internally, doesn't need chatgpt5 selection
+          // Get OpenAI API key (required for FLARE)
           const apiKey = apiKeyInput ? apiKeyInput.value.trim() : '';
           if (!apiKey) {
-            runStatus.textContent = 'Please enter a ChatGPT5 API key.';
+            runStatus.textContent = 'Please enter an OpenAI API key (required for FLARE).';
             runButton.disabled = false;
             return;
           }
           if (!(apiKeyStatus && apiKeyStatus.classList.contains('valid'))) {
-            runStatus.textContent = 'Please validate the ChatGPT5 API key before running tests.';
+            runStatus.textContent = 'Please validate the OpenAI API key before running tests.';
+            runButton.disabled = false;
+            return;
+          }
+          // FLARE uses openai_api_key (not chatgpt5_api_key)
+          overrides.openai_api_key = apiKey;
+          // Add retrieval instruction method if specified
+          const retrievalInstructionMethod = document.getElementById('input-retrieval_instruction_method')?.value.trim() || '';
+          if (retrievalInstructionMethod) {
+            overrides.retrieval_instruction_method = retrievalInstructionMethod;
+          }
+          // FLARE uses gpt-3.5-turbo-instruct, don't override generator_model
+          // The generator dropdown is disabled when FLARE is selected
+        } else if (generatorValue === 'chatgpt5') {
+          // Only check for chatgpt5 API key when FLARE is NOT selected
+          const apiKey = apiKeyInput ? apiKeyInput.value.trim() : '';
+          if (!apiKey) {
+            runStatus.textContent = 'Please enter an OpenAI API key.';
+            runButton.disabled = false;
+            return;
+          }
+          if (!(apiKeyStatus && apiKeyStatus.classList.contains('valid'))) {
+            runStatus.textContent = 'Please validate the OpenAI API key before running tests.';
             runButton.disabled = false;
             return;
           }
@@ -1713,7 +1894,7 @@ TEMPLATE = """
           overrides.split = splitDisplay.textContent.trim();
         }
         
-        console.log('Sending test run request with overrides:', { ...overrides, chatgpt5_api_key: overrides.chatgpt5_api_key ? '***' : undefined });
+        console.log('Sending test run request with overrides:', { ...overrides, chatgpt5_api_key: overrides.chatgpt5_api_key ? '***' : undefined, openai_api_key: overrides.openai_api_key ? '***' : undefined });
         
         fetch('/run-tests', {
           method: 'POST',
@@ -1795,28 +1976,60 @@ def api_status():
 
 @app.route("/validate-chatgpt5", methods=["POST"])
 def validate_chatgpt5():
+    """Validate ChatGPT5 API key using ChatGPT5Automation."""
     payload = request.get_json(silent=True) or {}
     api_key = payload.get("api_key")
     if not api_key:
         return jsonify({"success": False, "message": "API key is required."}), 400
 
-    options_dict = vars(TEST_OPTIONS).copy()
-    options_dict["chatgpt5_api_key"] = api_key
-    options_dict["generator_model"] = "chatgpt5"
-    temp_options = argparse.Namespace(**options_dict)
-
-    clear_results_file()
     try:
-        run_test_script(temp_options)
+        # Use ChatGPT5Automation to validate the API key directly
+        # This is the same approach used for FLARE OpenAI validation
+        sys.path.insert(0, str(PROJECT_ROOT / "NSTSCE"))
+        from ChatGPT5Automation import ChatGPT5Automation
+        
+        chatgpt5 = ChatGPT5Automation(api_key=api_key)
+        is_valid, message = chatgpt5.validate_api_key()
+        
+        if is_valid:
+            return jsonify({"success": True, "message": "API key is valid."})
+        else:
+            return jsonify({"success": False, "message": message}), 400
+            
     except Exception as exc:
         app.logger.error("API key validation failed: %s", exc)
-        return jsonify({"success": False, "message": str(exc)}), 500
+        import traceback
+        app.logger.error("Traceback: %s", traceback.format_exc())
+        return jsonify({"success": False, "message": f"Validation error: {str(exc)}"}), 500
 
-    results = load_results()
-    is_valid = bool(results)
-    message = "API key is valid." if is_valid else "Unable to confirm API key validity."
-    return jsonify({"success": is_valid, "message": message})
 
+@app.route("/validate-openai", methods=["POST"])
+def validate_openai():
+    """Validate OpenAI API key for FLARE using ChatGPT5Automation."""
+    payload = request.get_json(silent=True) or {}
+    api_key = payload.get("api_key")
+    if not api_key:
+        return jsonify({"success": False, "message": "API key is required."}), 400
+
+    try:
+        # Use ChatGPT5Automation to validate the API key directly
+        # This is the same approach used for ChatGPT5 validation
+        sys.path.insert(0, str(PROJECT_ROOT / "NSTSCE"))
+        from ChatGPT5Automation import ChatGPT5Automation
+        
+        chatgpt5 = ChatGPT5Automation(api_key=api_key)
+        is_valid, message = chatgpt5.validate_api_key()
+        
+        if is_valid:
+            return jsonify({"success": True, "message": "API key is valid."})
+        else:
+            return jsonify({"success": False, "message": message}), 400
+            
+    except Exception as exc:
+        app.logger.error("API key validation failed: %s", exc)
+        import traceback
+        app.logger.error("Traceback: %s", traceback.format_exc())
+        return jsonify({"success": False, "message": f"Validation error: {str(exc)}"}), 500
 
 @app.route("/api/results")
 def api_results():
@@ -1858,7 +2071,7 @@ def trigger_run():
     if "rag_systems" in payload and isinstance(payload["rag_systems"], list) and payload["rag_systems"]:
         # Multiple RAG systems
         rag_systems = [str(r).strip().lower() for r in payload["rag_systems"]]
-        valid_rag_systems = [r for r in rag_systems if r in ("naive-rag", "self-rag")]
+        valid_rag_systems = [r for r in rag_systems if r in ("naive-rag", "self-rag", "flare")]
         if valid_rag_systems:
             if len(valid_rag_systems) == 1:
                 # Single RAG system - use legacy field for compatibility
@@ -1872,7 +2085,7 @@ def trigger_run():
     elif "rag_system" in payload and payload["rag_system"]:
         # Single RAG system (legacy support)
         rag_system_value = str(payload["rag_system"]).strip().lower()
-        if rag_system_value in ("naive-rag", "self-rag"):
+        if rag_system_value in ("naive-rag", "self-rag", "flare"):
             options_dict["rag_system"] = rag_system_value
         else:
             options_dict["rag_system"] = "naive-rag"
@@ -1898,20 +2111,60 @@ def trigger_run():
         if options_dict["dataset"] not in ("qasper", "qmsum", "narrativeqa", "quality", "hotpot", "musique", "xsum", "wikiasp", "longbench"):
             options_dict["dataset"] = "qasper"
 
-    generator_value = str(options_dict.get("generator_model", TEST_OPTIONS.generator_model or "t5-small")).lower()
-    api_key_override = payload.get("chatgpt5_api_key")
-
-    if generator_value == "chatgpt5":
+    # Default generator model based on RAG system
+    # FLARE uses 'gpt-3.5-turbo-instruct' internally (not selectable), others use 't5-small'
+    rag_systems = options_dict.get("rag_systems", [])
+    rag_system = options_dict.get("rag_system", TEST_OPTIONS.rag_system if hasattr(TEST_OPTIONS, 'rag_system') else "naive-rag")
+    
+    # If FLARE is selected, it uses gpt-3.5-turbo-instruct internally (not chatgpt5)
+    is_flare_selected = (rag_systems and 'flare' in rag_systems) or rag_system == 'flare'
+    
+    # FLARE doesn't use the generator_model from the dropdown - it uses gpt-3.5-turbo-instruct
+    # For other RAG systems, default to t5-small
+    default_generator = "t5-small"
+    generator_value = str(options_dict.get("generator_model", TEST_OPTIONS.generator_model or default_generator)).lower()
+    
+    # Handle FLARE first
+    if is_flare_selected:
+        # FLARE uses gpt-3.5-turbo-instruct internally
+        generator_value = "gpt-3.5-turbo-instruct"
+        options_dict["generator_model"] = "gpt-3.5-turbo-instruct"
+        options_dict["use_chatgpt5"] = True  # Set use_chatgpt5 flag for FLARE
+        
+        # FLARE requires OpenAI API key - check both openai_api_key and chatgpt5_api_key
+        openai_api_key = payload.get("openai_api_key") or payload.get("chatgpt5_api_key")
+        if openai_api_key:
+            options_dict["openai_api_key"] = openai_api_key
+        else:
+            return jsonify({"status": "error", "message": "FLARE requires an OpenAI API key."}), 400
+        options_dict["chatgpt5_api_key"] = None  # FLARE doesn't use chatgpt5_api_key
+        
+        # Handle retrieval instruction method for FLARE
+        if "retrieval_instruction_method" in payload:
+            retrieval_method = str(payload["retrieval_instruction_method"]).strip()
+            if retrieval_method and retrieval_method in ("cot", "strategyqa", "summary"):
+                options_dict["retrieval_instruction_method"] = retrieval_method
+            else:
+                options_dict["retrieval_instruction_method"] = None
+        else:
+            options_dict["retrieval_instruction_method"] = None
+    elif generator_value == "chatgpt5":
+        # Only handle chatgpt5 when FLARE is NOT selected
+        api_key_override = payload.get("chatgpt5_api_key")
         if not api_key_override:
             return jsonify({"status": "error", "message": "ChatGPT5 generator requires an API key."}), 400
         options_dict["chatgpt5_api_key"] = api_key_override
+        options_dict["openai_api_key"] = None
+        options_dict["retrieval_instruction_method"] = None
     else:
         options_dict["chatgpt5_api_key"] = None
+        options_dict["openai_api_key"] = None
+        options_dict["retrieval_instruction_method"] = None
 
     updated_options = argparse.Namespace(**options_dict)
     
-    # Log the options being used
-    app.logger.info("Triggering test run with options: %s", {k: v for k, v in options_dict.items() if k != "chatgpt5_api_key"})
+    # Log the options being used (excluding API keys)
+    app.logger.info("Triggering test run with options: %s", {k: v for k, v in options_dict.items() if k not in ("chatgpt5_api_key", "openai_api_key")})
 
     clear_results_file()
     RUN_STATE["message"] = "Test run initiated..."
@@ -1943,7 +2196,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--show-context", dest="show_context", action="store_true", help="Display retrieved context in outputs.")
     parser.add_argument("--hide-context", dest="show_context", action="store_false", help="Hide retrieved context in outputs.")
     parser.set_defaults(show_context=False)
-    parser.add_argument("--rag-system", choices=["naive-rag", "self-rag"], default="naive-rag", help="RAG system to use: 'naive-rag' (default) or 'self-rag'.")
+    parser.add_argument("--rag-system", choices=["naive-rag", "self-rag", "flare"], default="naive-rag", help="RAG system to use: 'naive-rag' (default), 'self-rag', or 'flare'.")
     parser.add_argument("--dataset", choices=["qasper", "qmsum", "narrativeqa", "quality", "hotpot", "musique", "xsum", "wikiasp", "longbench"], default="qasper", help="Dataset to use: 'qasper', 'qmsum', 'narrativeqa', 'quality', 'hotpot', 'musique', 'xsum', 'wikiasp', or 'longbench'.")
     parser.add_argument("--log-level", default="INFO", help="Log level passed to the test script.")
     parser.add_argument("--results-path", default=str(DEFAULT_RESULTS_PATH), help="Where to write the results JSON.")
@@ -1956,9 +2209,37 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    import atexit
+    import signal
+    
+    def shutdown_handler(signum=None, frame=None):
+        """Handle shutdown signals and log termination."""
+        app.logger.info("=" * 80)
+        app.logger.info("QASPER Interface Terminating")
+        app.logger.info("=" * 80)
+        app.logger.info("Log file: %s", LOG_FILE)
+        app.logger.info("Shutdown signal received: %s", signum if signum else "atexit")
+        # Flush all log handlers
+        for handler in logging.root.handlers:
+            handler.flush()
+        sys.exit(0)
+    
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
+    atexit.register(shutdown_handler)
+    
     TEST_OPTIONS = parse_args()
     RESULTS_PATH = Path(TEST_OPTIONS.results_path).resolve()
     RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    app.logger.info("Configuration:")
+    app.logger.info("  Host: %s", TEST_OPTIONS.host)
+    app.logger.info("  Port: %s", TEST_OPTIONS.port)
+    app.logger.info("  Results path: %s", RESULTS_PATH)
+    app.logger.info("  Dataset: %s", TEST_OPTIONS.dataset)
+    app.logger.info("  RAG system: %s", getattr(TEST_OPTIONS, "rag_system", "naive-rag"))
+    app.logger.info("  Run on start: %s", TEST_OPTIONS.run_on_start)
 
     if TEST_OPTIONS.run_on_start:
         clear_results_file()
@@ -1970,7 +2251,15 @@ if __name__ == "__main__":
         target_host = TEST_OPTIONS.host if TEST_OPTIONS.host not in ("0.0.0.0", "::") else "127.0.0.1"
         Timer = threading.Timer
         Timer(1.5, lambda: webbrowser.open(f"http://{target_host}:{TEST_OPTIONS.port}")).start()
+        app.logger.info("Browser will open at: http://%s:%s", target_host, TEST_OPTIONS.port)
 
-    app.run(host=TEST_OPTIONS.host, port=TEST_OPTIONS.port, debug=True)
+    app.logger.info("Starting Flask server...")
+    try:
+        app.run(host=TEST_OPTIONS.host, port=TEST_OPTIONS.port, debug=True)
+    except KeyboardInterrupt:
+        shutdown_handler()
+    except Exception as e:
+        app.logger.exception("Fatal error during server execution: %s", e)
+        shutdown_handler()
 
 

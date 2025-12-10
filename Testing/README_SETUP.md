@@ -9,10 +9,18 @@ This directory contains scripts for testing RAG systems against various datasets
 Create and activate the conda environment:
 
 ```bash
-cd /home/zyuan/RAGbot/Testing
+cd /home/zyuan/NSTSCE_Bot/Testing
 conda env create -f environment.yml
 conda activate rag-testing
 ```
+
+**Important:** After creating the environment, download the required spacy model for FLARE:
+
+```bash
+python -m spacy download en_core_web_sm
+```
+
+This model is required for FLARE to function properly.
 
 ### Option 2: Manual Installation
 
@@ -58,12 +66,12 @@ Self-RAG requires a separate conda environment with vLLM installed. Use the envi
 
 ```bash
 # Create the selfrag environment (if not already created)
-cd /home/zyuan/RAGbot/RAGSystem/self-rag
+cd /home/zyuan/NSTSCE_Bot/RAGSystem/self-rag
 conda env create -f environment.yml
 conda activate selfrag
 
 # Then run tests with self-rag
-cd /home/zyuan/RAGbot/Testing
+cd /home/zyuan/NSTSCE_Bot/Testing
 python test_qasper_rag.py --rag-system self-rag --dataset qasper
 ```
 
@@ -71,6 +79,7 @@ python test_qasper_rag.py --rag-system self-rag --dataset qasper
 
 - The `rag-testing` environment is optimized for naive-rag and general testing
 - For Self-RAG, use the `selfrag` environment which includes vLLM and CUDA dependencies
+- **For FLARE**: After creating the environment, make sure to run `python -m spacy download en_core_web_sm` as FLARE requires this spacy model
 - Make sure to activate the correct environment before running scripts
 - The web interface (`qasper_interface.py`) will use the Python from the currently active conda environment
 

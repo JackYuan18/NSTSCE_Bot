@@ -47,7 +47,6 @@ dependencies:
       - confection==0.1.4
       - cymem==2.0.8
       - dataclasses==0.6
-      - datasets==2.15.0
       - deepspeed==0.12.6
       - dill==0.3.7
       - einops==0.7.0
@@ -171,7 +170,25 @@ dependencies:
       # ============================================
       # Additional dependencies for Testing framework
       # ============================================
-      - flask==2.3.3
+      - datasets==2.15.0
+      - flask==3.0.3
       - PyPDF2==3.0.1
       - sentence-transformers==2.2.2
       - faiss-cpu==1.7.4
+      
+      # ============================================
+      # FLARE dependencies
+      # ============================================
+      - beir==1.0.1
+      - scipy==1.10.1
+      - chardet==5.1.0
+      - cchardet==2.1.7
+      - beautifulsoup4==4.11.2
+      - tenacity==8.2.3
+      
+      # ============================================
+      # Post-installation steps (run after creating environment)
+      # ============================================
+      # After creating the environment, run:
+      # python -m spacy download en_core_web_sm
+      # This is required for FLARE to work properly

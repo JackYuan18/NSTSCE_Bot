@@ -27,12 +27,49 @@ class ChatGPT5Automation:
                 self.logger.error("OpenAI API key not provided. Set OPENAI_API_KEY environment variable or pass api_key parameter.")
                 return False
             
-            self.client = OpenAI(api_key=self.api_key)
-            self.logger.info("OpenAI client initialized successfully")
-            return True
+            # Clear any proxy environment variables that might interfere with OpenAI client initialization
+            # OpenAI API 1.0+ doesn't support proxies parameter in constructor
+            import os
+            import httpx
+            proxy_vars = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']
+            original_proxies = {}
+            for var in proxy_vars:
+                if var in os.environ:
+                    original_proxies[var] = os.environ.pop(var)
+            
+            try:
+                # The issue is that OpenAI's internal code tries to pass 'proxies' (plural) to httpx.Client
+                # but httpx only accepts 'proxy' (singular). We need to monkey-patch httpx.Client
+                # to filter out the 'proxies' argument before it reaches httpx
+                original_init = httpx.Client.__init__
+                
+                def patched_init(self, *args, **kwargs):
+                    # Remove 'proxies' if present (OpenAI might pass it)
+                    kwargs.pop('proxies', None)
+                    # Also ensure trust_env is False to prevent reading proxy env vars
+                    kwargs['trust_env'] = False
+                    return original_init(self, *args, **kwargs)
+                
+                # Apply the patch
+                httpx.Client.__init__ = patched_init
+                
+                try:
+                    # Now create the OpenAI client - it should work without the proxies error
+                    self.client = OpenAI(api_key=self.api_key)
+                    self.logger.info("OpenAI client initialized successfully")
+                    return True
+                finally:
+                    # Restore original httpx.Client.__init__
+                    httpx.Client.__init__ = original_init
+            finally:
+                # Restore proxy environment variables
+                for var, value in original_proxies.items():
+                    os.environ[var] = value
             
         except Exception as e:
             self.logger.error(f"Failed to initialize OpenAI client: {e}")
+            import traceback
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
             return False
     
     def generate_response(self, query: str, context: str) -> Tuple[bool, str]:
@@ -84,8 +121,16 @@ Please provide a detailed answer based on the context provided. If the context d
         Validates the API key by making a simple test request.
         Returns (is_valid: bool, message: str).
         """
+        # Try to initialize client if not already initialized
         if not self.client:
-            return False, "OpenAI client not initialized. Please check your API key."
+            if not self.api_key:
+                return False, "OpenAI API key not provided. Please check your API key."
+            # Retry initialization
+            try:
+                if not self._initialize_client():
+                    return False, "OpenAI client not initialized. Please check your API key and ensure it's valid."
+            except Exception as e:
+                return False, f"Failed to initialize OpenAI client: {str(e)}"
         
         try:
             # Make a simple test request to validate the API key
