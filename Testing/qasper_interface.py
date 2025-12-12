@@ -37,9 +37,9 @@ LOG_FILE = LOG_DIR / f"qasper_interface_{datetime.now().strftime('%Y%m%d_%H%M%S'
 
 app = Flask(__name__)
 
-# Configure file logging
+# Configure file logging - use DEBUG level to capture all messages
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Changed to DEBUG to capture all messages including DEBUG level
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
@@ -179,6 +179,16 @@ def run_test_script(options: argparse.Namespace) -> subprocess.CompletedProcess[
             line = line.rstrip()
             stdout_lines.append(line)
             
+            # Always log the raw line to the log file for debugging (mask API keys)
+            masked_line = mask_string_for_logging(line)
+            app.logger.debug("RAW OUTPUT: %s", masked_line)
+            
+            # Also check if line contains [FLARE] even if it's not at the start
+            # This catches logger output that might be formatted differently
+            if "[FLARE]" in line and "[FLARE]" not in [part for part in line.split() if part.startswith("[FLARE]")]:
+                # This is a formatted log line containing [FLARE], log it
+                app.logger.info("FLARE log: %s", masked_line)
+            
             # Check if this is a [Self-RAG] progress message
             if "[Self-RAG]" in line:
                 # Extract the message after [Self-RAG]
@@ -205,24 +215,52 @@ def run_test_script(options: argparse.Namespace) -> subprocess.CompletedProcess[
                     # Log the full line if it contains [FLARE]
                     app.logger.info("FLARE output: %s", line)
             
+            # Check for [TEST] messages
+            elif "[TEST]" in line:
+                masked_line = mask_string_for_logging(line)
+                app.logger.info("TEST: %s", masked_line)
+                # Also log to file explicitly (masked)
+                print(f"TEST OUTPUT: {masked_line}", file=sys.stderr, flush=True)
+            
+            # Check for [FLARE ERROR] messages
+            elif "[FLARE ERROR]" in line:
+                masked_line = mask_string_for_logging(line)
+                app.logger.error("FLARE ERROR: %s", masked_line)
+                print(f"FLARE ERROR OUTPUT: {masked_line}", file=sys.stderr, flush=True)
+            
             # Check for ERROR or WARNING in the line (important messages)
             elif any(level in line.upper() for level in ["ERROR", "WARNING", "CRITICAL", "EXCEPTION"]):
+                # Mask API keys before logging
+                masked_line = mask_string_for_logging(line)
                 # Log errors and warnings at appropriate levels
                 if "ERROR" in line.upper() or "CRITICAL" in line.upper() or "EXCEPTION" in line.upper():
-                    app.logger.error("Test script: %s", line)
+                    app.logger.error("Test script: %s", masked_line)
                 elif "WARNING" in line.upper():
-                    app.logger.warning("Test script: %s", line)
+                    app.logger.warning("Test script: %s", masked_line)
                 else:
-                    app.logger.info("Test output: %s", line)
+                    app.logger.info("Test output: %s", masked_line)
             
             # Log other important messages at INFO level (not just DEBUG)
             # This includes INFO level messages from the test script
             elif "INFO" in line.upper() or any(keyword in line for keyword in ["Processing", "Loading", "Initializing", "Completed", "Finished"]):
-                app.logger.info("Test output: %s", line)
+                masked_line = mask_string_for_logging(line)
+                app.logger.info("Test output: %s", masked_line)
             
-            # Log everything else at DEBUG level
+            # Log everything else - but also check for print statements that might be important
             else:
-                app.logger.debug("Test output: %s", line)
+                # Mask API keys before logging
+                masked_line = mask_string_for_logging(line)
+                # Check if line contains [FLARE] (catch any that weren't caught above)
+                if "[FLARE]" in line:
+                    app.logger.info("FLARE log: %s", masked_line)
+                # Check if line contains important keywords
+                elif any(keyword in line for keyword in ["ERROR", "WARNING", "Exception", "Traceback", "Failed", "Error"]):
+                    app.logger.error("Test output: %s", masked_line)
+                elif any(keyword in line for keyword in ["Loading", "Initializing", "Creating", "About to", "TEST", "FLARE", "RAGSystem"]):
+                    app.logger.info("Test output: %s", masked_line)
+                else:
+                    # Log everything at INFO level so it appears in the log file
+                    app.logger.info("Test output: %s", masked_line)
         
         # Wait for process to complete
         returncode = process.wait(timeout=3600)
@@ -239,13 +277,19 @@ def run_test_script(options: argparse.Namespace) -> subprocess.CompletedProcess[
         app.logger.error("Test script timed out after 1 hour")
         return subprocess.CompletedProcess(cmd, 1, "", "Test script timed out")
     except Exception as exc:
-        app.logger.error("Failed to run test script: %s", exc)
-        return subprocess.CompletedProcess(cmd, 1, "", str(exc))
+        error_msg = str(exc)
+        masked_error = mask_string_for_logging(error_msg)
+        app.logger.error("Failed to run test script: %s", masked_error)
+        return subprocess.CompletedProcess(cmd, 1, "", masked_error)
     
     if result.returncode != 0:
         app.logger.error("Test script failed with return code %d", result.returncode)
-        app.logger.error("STDOUT: %s", result.stdout[-1000:] if result.stdout else "(empty)")
-        app.logger.error("STDERR: %s", result.stderr[-1000:] if result.stderr else "(empty)")
+        stdout_snippet = result.stdout[-1000:] if result.stdout else "(empty)"
+        stderr_snippet = result.stderr[-1000:] if result.stderr else "(empty)"
+        masked_stdout = mask_string_for_logging(stdout_snippet) if isinstance(stdout_snippet, str) else stdout_snippet
+        masked_stderr = mask_string_for_logging(stderr_snippet) if isinstance(stderr_snippet, str) else stderr_snippet
+        app.logger.error("STDOUT: %s", masked_stdout)
+        app.logger.error("STDERR: %s", masked_stderr)
     else:
         app.logger.info("Test script completed successfully")
         if results_path_abs.exists():
@@ -255,7 +299,9 @@ def run_test_script(options: argparse.Namespace) -> subprocess.CompletedProcess[
                     data = json.load(f)
                     app.logger.info("Results file contains %d entries", len(data) if isinstance(data, list) else 0)
             except Exception as e:
-                app.logger.error("Failed to read results file: %s", e)
+                error_msg = str(e)
+                masked_error = mask_string_for_logging(error_msg)
+                app.logger.error("Failed to read results file: %s", masked_error)
         else:
             app.logger.warning("Results file not found at: %s", results_path_abs)
     return result
@@ -314,7 +360,9 @@ def run_multiple_datasets(options: argparse.Namespace, datasets: List[str]) -> s
             else:
                 app.logger.warning("Results file not found after dataset %s run: %s", dataset, results_path_abs)
         except Exception as exc:
-            app.logger.error("Failed to load results for dataset %s: %s", dataset, exc)
+            error_msg = str(exc)
+            masked_error = mask_string_for_logging(error_msg)
+            app.logger.error("Failed to load results for dataset %s: %s", dataset, masked_error)
     
     # Save combined results
     try:
@@ -325,7 +373,9 @@ def run_multiple_datasets(options: argparse.Namespace, datasets: List[str]) -> s
         if not all_results:
             app.logger.warning("No results collected from any dataset!")
     except Exception as exc:
-        app.logger.error("Failed to save combined results to %s: %s", results_path_abs, exc)
+        error_msg = str(exc)
+        masked_error = mask_string_for_logging(error_msg)
+        app.logger.error("Failed to save combined results to %s: %s", results_path_abs, masked_error)
         raise
     
     # Return combined result
@@ -390,7 +440,9 @@ def run_multiple_rag_systems(options: argparse.Namespace, rag_systems: List[str]
             else:
                 app.logger.warning("Results file not found after RAG system %s run: %s", rag_system, results_path_abs)
         except Exception as exc:
-            app.logger.error("Failed to load results for RAG system %s: %s", rag_system, exc)
+            error_msg = str(exc)
+            masked_error = mask_string_for_logging(error_msg)
+            app.logger.error("Failed to load results for RAG system %s: %s", rag_system, masked_error)
     
     # Save combined results
     try:
@@ -401,7 +453,9 @@ def run_multiple_rag_systems(options: argparse.Namespace, rag_systems: List[str]
         if not all_results:
             app.logger.warning("No results collected from any RAG system!")
     except Exception as exc:
-        app.logger.error("Failed to save combined results to %s: %s", results_path_abs, exc)
+        error_msg = str(exc)
+        masked_error = mask_string_for_logging(error_msg)
+        app.logger.error("Failed to save combined results to %s: %s", results_path_abs, masked_error)
         raise
     
     # Return combined result
@@ -458,7 +512,9 @@ def start_test_run(options: argparse.Namespace, *, async_run: bool = True) -> bo
                             count = len(data) if isinstance(data, list) else 0
                             app.logger.info("Results file verified: %d entries", count)
                     except Exception as e:
-                        app.logger.error("Failed to verify results file: %s", e)
+                        error_msg = str(e)
+                        masked_error = mask_string_for_logging(error_msg)
+                        app.logger.error("Failed to verify results file: %s", masked_error)
                 else:
                     app.logger.warning("Results file missing after successful run: %s", results_path_abs)
             else:
@@ -583,11 +639,55 @@ def calculate_dataset_statistics(results: List[Dict[str, Any]]) -> Dict[str, Dic
     return statistics
 
 
+def mask_api_key(value: Any) -> Any:
+    """Mask API key values in logging output."""
+    if isinstance(value, str):
+        # Check if it looks like an API key (starts with sk- and is long)
+        if value.startswith('sk-') and len(value) > 20:
+            return value[:7] + '...' + value[-4:] if len(value) > 11 else '***'
+        # Check for other common API key patterns
+        if len(value) > 20 and any(pattern in value.lower() for pattern in ['api', 'key', 'token']):
+            return value[:7] + '...' + value[-4:] if len(value) > 11 else '***'
+    return value
+
+
+def mask_dict_for_logging(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Mask API keys in a dictionary for safe logging."""
+    masked = {}
+    api_key_fields = ['api_key', 'openai_api_key', 'chatgpt5_api_key', 'api-key', 'openai-api-key', 'chatgpt5-api-key']
+    for key, value in data.items():
+        if any(api_field in key.lower() for api_field in api_key_fields):
+            masked[key] = mask_api_key(value) if value else None
+        elif isinstance(value, dict):
+            masked[key] = mask_dict_for_logging(value)
+        elif isinstance(value, list):
+            masked[key] = [mask_dict_for_logging(item) if isinstance(item, dict) else mask_api_key(item) if isinstance(item, str) else item for item in value]
+        else:
+            masked[key] = value
+    return masked
+
+
+def mask_string_for_logging(text: str) -> str:
+    """Mask API keys in a string for safe logging."""
+    import re
+    # Pattern for OpenAI API keys (sk-proj-... or sk-...)
+    patterns = [
+        (r'sk-proj-[A-Za-z0-9]{20,}', lambda m: m.group()[:10] + '...' + m.group()[-4:]),
+        (r'sk-[A-Za-z0-9]{20,}', lambda m: m.group()[:7] + '...' + m.group()[-4:]),
+    ]
+    masked_text = text
+    for pattern, replacer in patterns:
+        masked_text = re.sub(pattern, replacer, masked_text)
+    return masked_text
+
+
 def clear_results_file() -> None:
     try:
         RESULTS_PATH.write_text("[]", encoding="utf-8")
     except Exception as exc:
-        app.logger.error("Failed to clear results file %s: %s", RESULTS_PATH, exc)
+        error_msg = str(exc)
+        masked_error = mask_string_for_logging(error_msg)
+        app.logger.error("Failed to clear results file %s: %s", RESULTS_PATH, masked_error)
 
 
 TEMPLATE = """
@@ -1851,20 +1951,13 @@ TEMPLATE = """
         // Check if FLARE is selected
         if (checkedRAGSystems.includes('flare')) {
           // FLARE uses gpt-3.5-turbo-instruct internally, doesn't need chatgpt5 selection
-          // Get OpenAI API key (required for FLARE)
+          // Get OpenAI API key (optional - FLARE can run without it and will show error message)
           const apiKey = apiKeyInput ? apiKeyInput.value.trim() : '';
-          if (!apiKey) {
-            runStatus.textContent = 'Please enter an OpenAI API key (required for FLARE).';
-            runButton.disabled = false;
-            return;
-          }
-          if (!(apiKeyStatus && apiKeyStatus.classList.contains('valid'))) {
-            runStatus.textContent = 'Please validate the OpenAI API key before running tests.';
-            runButton.disabled = false;
-            return;
-          }
           // FLARE uses openai_api_key (not chatgpt5_api_key)
-          overrides.openai_api_key = apiKey;
+          // Set API key if provided, otherwise leave it undefined (backend will handle it)
+          if (apiKey) {
+            overrides.openai_api_key = apiKey;
+          }
           // Add retrieval instruction method if specified
           const retrievalInstructionMethod = document.getElementById('input-retrieval_instruction_method')?.value.trim() || '';
           if (retrievalInstructionMethod) {
@@ -1997,10 +2090,14 @@ def validate_chatgpt5():
             return jsonify({"success": False, "message": message}), 400
             
     except Exception as exc:
-        app.logger.error("API key validation failed: %s", exc)
+        error_msg = str(exc)
+        masked_error = mask_string_for_logging(error_msg)
+        app.logger.error("API key validation failed: %s", masked_error)
         import traceback
-        app.logger.error("Traceback: %s", traceback.format_exc())
-        return jsonify({"success": False, "message": f"Validation error: {str(exc)}"}), 500
+        tb_str = traceback.format_exc()
+        masked_tb = mask_string_for_logging(tb_str)
+        app.logger.error("Traceback: %s", masked_tb)
+        return jsonify({"success": False, "message": f"Validation error: {masked_error}"}), 500
 
 
 @app.route("/validate-openai", methods=["POST"])
@@ -2026,10 +2123,14 @@ def validate_openai():
             return jsonify({"success": False, "message": message}), 400
             
     except Exception as exc:
-        app.logger.error("API key validation failed: %s", exc)
+        error_msg = str(exc)
+        masked_error = mask_string_for_logging(error_msg)
+        app.logger.error("API key validation failed: %s", masked_error)
         import traceback
-        app.logger.error("Traceback: %s", traceback.format_exc())
-        return jsonify({"success": False, "message": f"Validation error: {str(exc)}"}), 500
+        tb_str = traceback.format_exc()
+        masked_tb = mask_string_for_logging(tb_str)
+        app.logger.error("Traceback: %s", masked_tb)
+        return jsonify({"success": False, "message": f"Validation error: {masked_error}"}), 500
 
 @app.route("/api/results")
 def api_results():
@@ -2048,7 +2149,8 @@ def api_statistics():
 def trigger_run():
     app.logger.info("Received POST request to /run-tests")
     payload = request.get_json(silent=True) or {}
-    app.logger.info("Request payload (without API key): %s", {k: v for k, v in payload.items() if k != "chatgpt5_api_key"})
+    masked_payload = mask_dict_for_logging(payload)
+    app.logger.info("Request payload: %s", masked_payload)
     options_dict = vars(TEST_OPTIONS).copy()
 
     for field in ("retrieval_k", "chunk_size", "questions_per_article", "articles"):
@@ -2131,12 +2233,12 @@ def trigger_run():
         options_dict["generator_model"] = "gpt-3.5-turbo-instruct"
         options_dict["use_chatgpt5"] = True  # Set use_chatgpt5 flag for FLARE
         
-        # FLARE requires OpenAI API key - check both openai_api_key and chatgpt5_api_key
+        # FLARE can run without API key - it will handle the error during query
         openai_api_key = payload.get("openai_api_key") or payload.get("chatgpt5_api_key")
         if openai_api_key:
             options_dict["openai_api_key"] = openai_api_key
         else:
-            return jsonify({"status": "error", "message": "FLARE requires an OpenAI API key."}), 400
+            options_dict["openai_api_key"] = None
         options_dict["chatgpt5_api_key"] = None  # FLARE doesn't use chatgpt5_api_key
         
         # Handle retrieval instruction method for FLARE
@@ -2163,8 +2265,9 @@ def trigger_run():
 
     updated_options = argparse.Namespace(**options_dict)
     
-    # Log the options being used (excluding API keys)
-    app.logger.info("Triggering test run with options: %s", {k: v for k, v in options_dict.items() if k not in ("chatgpt5_api_key", "openai_api_key")})
+    # Log the options being used (with API keys masked)
+    masked_options = mask_dict_for_logging(options_dict)
+    app.logger.info("Triggering test run with options: %s", masked_options)
 
     clear_results_file()
     RUN_STATE["message"] = "Test run initiated..."

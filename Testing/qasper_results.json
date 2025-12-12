@@ -20,7 +20,7 @@
     "f1_score": null,
     "recall_score": 0.0,
     "rouge_l_score": null,
-    "generation_time": 1.120636224746704,
+    "generation_time": 2.1348283290863037,
     "device": "CPU"
   },
   {
@@ -44,7 +44,32 @@
     "f1_score": null,
     "recall_score": 0.0,
     "rouge_l_score": null,
-    "generation_time": 0.8079700469970703,
+    "generation_time": 2.277129650115967,
+    "device": "CPU"
+  },
+  {
+    "article_id": "1912.01214",
+    "title": "Cross-lingual Pre-training Based Transfer for Zero-shot Neural Machine Translation",
+    "question": "which datasets did they experiment with?",
+    "generated_answer": "No answer generated.",
+    "reference_answers": [
+      "Europarl",
+      "MultiUN",
+      "Europarl BIBREF31",
+      "MultiUN BIBREF32"
+    ],
+    "retrieved_context": [],
+    "generator": "gpt-3.5-turbo-instruct",
+    "rag_system": "flare",
+    "dataset": "qasper",
+    "total_questions_in_dataset": 1005,
+    "total_questions_available": 3,
+    "bleu_score": null,
+    "exact_match": 0.0,
+    "f1_score": null,
+    "recall_score": 0.0,
+    "rouge_l_score": null,
+    "generation_time": 3.0332393646240234,
     "device": "CPU"
   }
 ]

@@ -136,32 +136,63 @@ def load_rag_system(rag_system_name: str) -> None:
         setup_logging = module.setup_logging
         
     elif rag_system_name == "flare":
+        print(f"[TEST] Loading FLARE system...", flush=True)
+        logging.info("[TEST] Loading FLARE system...")
         # Load FLARE from RAGSystem/FLARE/RAGSystem.py
         flare_path = PROJECT_ROOT / "RAGSystem" / "FLARE" / "RAGSystem.py"
+        print(f"[TEST] FLARE path: {flare_path}", flush=True)
+        logging.info(f"[TEST] FLARE path: {flare_path}")
         if not flare_path.exists():
-            raise FileNotFoundError(
+            error_msg = (
                 f"FLARE system not found at {flare_path}. "
                 "Please ensure FLARE has a RAGSystem.py file with RAGConfig, RAGSystem, and setup_logging."
             )
+            print(f"[TEST ERROR] {error_msg}", flush=True)
+            raise FileNotFoundError(error_msg)
         
         # Use importlib to load the module with a unique name
         spec = importlib.util.spec_from_file_location("flare_system", flare_path)
         if spec is None or spec.loader is None:
-            raise ImportError(f"Failed to create spec for {flare_path}")
+            error_msg = f"Failed to create spec for {flare_path}"
+            print(f"[TEST ERROR] {error_msg}", flush=True)
+            raise ImportError(error_msg)
         
         module = importlib.util.module_from_spec(spec)
         try:
+            print(f"[TEST] Executing FLARE module...", flush=True)
+            logging.info("[TEST] Executing FLARE module...")
             spec.loader.exec_module(module)
+            print(f"[TEST] FLARE module loaded successfully", flush=True)
+            logging.info("[TEST] FLARE module loaded successfully")
         except ImportError as e:
             # Check if it's a dependency error and enhance the message
+            print(f"[TEST ERROR] ImportError loading FLARE: {e}", flush=True)
+            logging.error(f"[TEST] ImportError loading FLARE: {e}")
             if is_dependency_error(e):
                 enhanced_error = handle_dependency_error(e)
                 raise type(e)(str(enhanced_error)) from e
+            raise
+        except Exception as e:
+            error_msg = str(e)
+            # Mask API keys in error message
+            import re
+            masked_error = re.sub(r'sk-proj-[A-Za-z0-9]{20,}', lambda m: m.group()[:10] + '...' + m.group()[-4:], error_msg)
+            masked_error = re.sub(r'sk-[A-Za-z0-9]{20,}', lambda m: m.group()[:7] + '...' + m.group()[-4:], masked_error)
+            print(f"[TEST ERROR] Exception loading FLARE: {masked_error}", flush=True)
+            logging.error(f"[TEST] Exception loading FLARE: {masked_error}")
+            import traceback
+            tb_str = traceback.format_exc()
+            # Mask API keys in traceback
+            masked_tb = re.sub(r'sk-proj-[A-Za-z0-9]{20,}', lambda m: m.group()[:10] + '...' + m.group()[-4:], tb_str)
+            masked_tb = re.sub(r'sk-[A-Za-z0-9]{20,}', lambda m: m.group()[:7] + '...' + m.group()[-4:], masked_tb)
+            logging.error(f"[TEST] Traceback: {masked_tb}")
             raise
         
         RAGConfig = module.RAGConfig
         RAGSystem = module.RAGSystem
         setup_logging = module.setup_logging
+        print(f"[TEST] FLARE RAGConfig, RAGSystem, setup_logging loaded", flush=True)
+        logging.info("[TEST] FLARE RAGConfig, RAGSystem, setup_logging loaded")
     else:
         raise ValueError(f"Unknown RAG system: {rag_system_name}. Choose from: naive-rag, self-rag, flare")
 
@@ -259,8 +290,7 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.generator_model.lower() == "chatgpt5" and not args.chatgpt5_api_key:
         parser.error("generator_model 'chatgpt5' requires --chatgpt5-api-key.")
-    if args.rag_system == "flare" and not args.openai_api_key:
-        parser.error("RAG system 'flare' requires --openai-api-key.")
+    # Note: FLARE can be loaded without API key - it will handle the error during query
     return args
 
 
@@ -388,13 +418,38 @@ def print_results(
 
 def main() -> None:
     """Main execution function."""
+    # Force unbuffered output for print statements
+    import sys
+    sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
+    sys.stderr.reconfigure(line_buffering=True) if hasattr(sys.stderr, 'reconfigure') else None
+    
+    print("[TEST] ===== test_qasper_rag.py main() called =====", flush=True)
     args = parse_args()
+    print(f"[TEST] Parsed args. RAG system: {args.rag_system}", flush=True)
     
     # Load the selected RAG system
+    print(f"[TEST] About to load RAG system: {args.rag_system}", flush=True)
     load_rag_system(args.rag_system)
+    print(f"[TEST] RAG system loaded: {args.rag_system}", flush=True)
     
+    print(f"[TEST] About to setup logging with level: {args.log_level}", flush=True)
     setup_logging(args.log_level)
     logger = logging.getLogger(__name__)
+    print(f"[TEST] Logging configured. Level: {args.log_level}", flush=True)
+    
+    # Ensure logging goes to stdout so it's captured by the interface
+    # Get the root logger and ensure it has a StreamHandler for stdout
+    root_logger = logging.getLogger()
+    has_stdout_handler = any(
+        isinstance(h, logging.StreamHandler) and h.stream == sys.stdout 
+        for h in root_logger.handlers
+    )
+    if not has_stdout_handler:
+        stdout_handler = logging.StreamHandler(sys.stdout)
+        stdout_handler.setLevel(getattr(logging, args.log_level.upper()))
+        stdout_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        root_logger.addHandler(stdout_handler)
+        print(f"[TEST] Added stdout handler to root logger", flush=True)
     
     logger.info("Using RAG system: %s", args.rag_system)
     
@@ -432,8 +487,33 @@ def main() -> None:
     if args.rag_system == 'flare' and args.retrieval_instruction_method:
         config_kwargs['retrieval_instruction_method'] = args.retrieval_instruction_method
     
+    print(f"[TEST] Creating RAGConfig with kwargs: { {k: v if k != 'openai_api_key' else ('***' if v else None) for k, v in config_kwargs.items()} }", flush=True)
+    logging.info(f"[TEST] Creating RAGConfig for {args.rag_system}")
     config = RAGConfig(**config_kwargs)
-    rag_system = RAGSystem(config)
+    print(f"[TEST] RAGConfig created. About to create RAGSystem...", flush=True)
+    logging.info(f"[TEST] About to create RAGSystem instance...")
+    try:
+        rag_system = RAGSystem(config)
+        print(f"[TEST] RAGSystem instance created successfully", flush=True)
+        logging.info(f"[TEST] RAGSystem instance created successfully")
+    except Exception as e:
+        error_msg = str(e)
+        # Mask API keys in error message
+        masked_error = error_msg
+        if 'api' in error_msg.lower() or 'key' in error_msg.lower():
+            import re
+            # Mask API key patterns
+            masked_error = re.sub(r'sk-proj-[A-Za-z0-9]{20,}', lambda m: m.group()[:10] + '...' + m.group()[-4:], masked_error)
+            masked_error = re.sub(r'sk-[A-Za-z0-9]{20,}', lambda m: m.group()[:7] + '...' + m.group()[-4:], masked_error)
+        print(f"[TEST ERROR] Exception creating RAGSystem: {masked_error}", flush=True)
+        logging.error(f"[TEST] Exception creating RAGSystem: {masked_error}")
+        import traceback
+        tb_str = traceback.format_exc()
+        # Mask API keys in traceback
+        masked_tb = re.sub(r'sk-proj-[A-Za-z0-9]{20,}', lambda m: m.group()[:10] + '...' + m.group()[-4:], tb_str)
+        masked_tb = re.sub(r'sk-[A-Za-z0-9]{20,}', lambda m: m.group()[:7] + '...' + m.group()[-4:], masked_tb)
+        logging.error(f"[TEST] Traceback: {masked_tb}")
+        raise
     
     # Initialize results tracking
     processed_articles = 0
@@ -548,8 +628,45 @@ def main() -> None:
             
             # Query RAG system and measure generation time
             start_time = time.time()
-            _, answer, retrieved_metadata = rag_system.query(question_text, k=args.retrieval_k)
-            generation_time = time.time() - start_time
+            
+            # Check if FLARE is selected and API key is missing
+            if args.rag_system == "flare" and not args.openai_api_key:
+                logger.warning("FLARE selected but no OpenAI API key provided. Skipping query.")
+                print(f"[TEST] FLARE selected without API key - skipping query", flush=True)
+                answer = "No OpenAI API key provided. FLARE requires OpenAI API for generation."
+                retrieved_metadata = []
+                generation_time = 0.0
+            # Check if naive-rag with chatgpt5 is selected and API key is missing
+            elif args.rag_system == "naive-rag" and args.generator_model.lower() == "chatgpt5" and not args.chatgpt5_api_key:
+                logger.warning("Naive RAG with ChatGPT5 selected but no OpenAI API key provided. Skipping query.")
+                print(f"[TEST] Naive RAG with ChatGPT5 selected without API key - skipping query", flush=True)
+                answer = "No OpenAI API key provided. Running Naive RAG with ChatGPT5 requires OpenAI API for generation."
+                retrieved_metadata = []
+                generation_time = 0.0
+            else:
+                logger.info(f"About to call rag_system.query for question: {question_text[:100]}...")
+                print(f"[TEST] About to call rag_system.query for FLARE", flush=True)
+                try:
+                    _, answer, retrieved_metadata = rag_system.query(question_text, k=args.retrieval_k)
+                    logger.info(f"rag_system.query returned answer: {answer[:100] if answer else 'None'}...")
+                    print(f"[TEST] rag_system.query returned answer length: {len(answer) if answer else 0}", flush=True)
+                except Exception as e:
+                    error_msg = str(e)
+                    # Mask API keys in error message
+                    import re
+                    masked_error = re.sub(r'sk-proj-[A-Za-z0-9]{20,}', lambda m: m.group()[:10] + '...' + m.group()[-4:], error_msg)
+                    masked_error = re.sub(r'sk-[A-Za-z0-9]{20,}', lambda m: m.group()[:7] + '...' + m.group()[-4:], masked_error)
+                    logger.error(f"Error calling rag_system.query: {masked_error}")
+                    import traceback
+                    tb_str = traceback.format_exc()
+                    # Mask API keys in traceback
+                    masked_tb = re.sub(r'sk-proj-[A-Za-z0-9]{20,}', lambda m: m.group()[:10] + '...' + m.group()[-4:], tb_str)
+                    masked_tb = re.sub(r'sk-[A-Za-z0-9]{20,}', lambda m: m.group()[:7] + '...' + m.group()[-4:], masked_tb)
+                    logger.error(f"Traceback: {masked_tb}")
+                    print(f"[TEST ERROR] Exception in rag_system.query: {masked_error}", flush=True)
+                    answer = f"Error: {masked_error}"
+                    retrieved_metadata = []
+                generation_time = time.time() - start_time
             
             # Get device information from RAG system
             device_used = getattr(rag_system.config, 'device', 'cpu')
@@ -630,5 +747,9 @@ def main() -> None:
         logger.info("Final write: Saved %d results to %s", len(collected_results), output_path)
 
 
+# Print at module level to verify script is being executed
+print("[TEST] test_qasper_rag.py module loaded", flush=True)
+
 if __name__ == "__main__":
+    print("[TEST] test_qasper_rag.py __main__ block executing", flush=True)
     main()
